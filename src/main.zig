@@ -101,10 +101,35 @@ const Input = struct {
     }
 };
 
+/// Returns `~/.config/editor-zig/init.lua`, or null if `HOME` has no value.
+fn configPath(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?[:0]u8 {
+    const home = env.get("HOME") orelse return null;
+    if (home.len == 0) return null;
+    return try std.fs.path.joinZ(arena, &.{ home, ".config", "editor-zig", "init.lua" });
+}
+
+/// Loads and runs the config file. If the file is missing or has an error,
+/// the editor starts without it.
+fn loadConfig(L: *c.lua_State, path: [:0]const u8) void {
+    if (c.luaL_loadfilex(L, path.ptr, null) != c.LUA_OK or
+        c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK)
+    {
+        c.lua_settop(L, -2); // pop the error message
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var writer = Io.File.stdout().writer(io, &.{});
     var stdout = &writer.interface;
+
+    // Load the config before ncurses takes control of the terminal.
+    const L = c.luaL_newstate() orelse return error.LuaInit;
+    defer c.lua_close(L);
+    c.luaL_openlibs(L);
+    if (try configPath(init.arena.allocator(), init.environ_map)) |path| {
+        loadConfig(L, path);
+    }
 
     _ = c.initscr();
     defer _ = c.endwin();
