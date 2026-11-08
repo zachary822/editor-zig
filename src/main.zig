@@ -13,6 +13,8 @@ const History = history.History;
 const Histories = history.Histories;
 const completion = @import("completion.zig");
 const ts = @import("syntax.zig");
+const text_worker = @import("text_worker.zig");
+const options = @import("options.zig");
 const layout = @import("layout.zig");
 const face = @import("face.zig");
 const lua_api = @import("lua_api.zig");
@@ -78,18 +80,12 @@ pub const Builtin = enum {
     // Buffers and windows.
     switch_to_buffer,
     kill_buffer,
-    list_buffers,
     split_window_below,
     split_window_right,
     other_window,
     delete_window,
     delete_other_windows,
     quit_window,
-    // Keys in the buffer list.
-    buffer_menu_this_window,
-    buffer_menu_other_window,
-    buffer_menu_switch_other_window,
-    buffer_menu_refresh,
 
     /// The properties of a command. See `builtin_info`.
     const Info = struct {
@@ -124,7 +120,7 @@ const builtin_info = std.enums.EnumArray(Builtin, Builtin.Info).init(.{
     .scroll_up_command = .{ .arg = .reads, .main_only = true },
     .scroll_down_command = .{ .arg = .reads, .main_only = true },
     .newline = .{},
-    .tab_to_tab_stop = .{},
+    .tab_to_tab_stop = .{ .arg = .reads },
     .delete_backward_char = .{ .opposite = .delete_char },
     .delete_char = .{ .opposite = .delete_backward_char },
     .kill_line = .{ .arg = .reads },
@@ -159,17 +155,12 @@ const builtin_info = std.enums.EnumArray(Builtin, Builtin.Info).init(.{
     .execute_extended_command = .{ .arg = .reads, .main_only = true },
     .switch_to_buffer = .{ .arg = .once, .main_only = true },
     .kill_buffer = .{ .arg = .once, .main_only = true },
-    .list_buffers = .{ .arg = .once, .main_only = true },
     .split_window_below = .{ .arg = .once, .main_only = true },
     .split_window_right = .{ .arg = .once, .main_only = true },
     .other_window = .{ .main_only = true },
     .delete_window = .{ .arg = .once, .main_only = true },
     .delete_other_windows = .{ .arg = .once, .main_only = true },
     .quit_window = .{ .arg = .once, .main_only = true },
-    .buffer_menu_this_window = .{ .arg = .once, .main_only = true },
-    .buffer_menu_other_window = .{ .arg = .once, .main_only = true },
-    .buffer_menu_switch_other_window = .{ .arg = .once, .main_only = true },
-    .buffer_menu_refresh = .{ .arg = .once, .main_only = true },
 });
 
 pub const Command = union(enum) {
@@ -240,7 +231,6 @@ const default_bindings = [_]struct { []const u8, Builtin }{
     .{ "M-9", .digit_argument },
     .{ "C-x b", .switch_to_buffer },
     .{ "C-x k", .kill_buffer },
-    .{ "C-x C-b", .list_buffers },
     .{ "C-x 2", .split_window_below },
     .{ "C-x 3", .split_window_right },
     .{ "C-x o", .other_window },
@@ -274,15 +264,11 @@ const isearch_bindings = [_]struct { []const u8, Builtin }{
     .{ "M-n", .next_history_element },
 };
 
-const tab_width = 8;
-
 const prefix_arg_max = @import("prefix_arg.zig").max_count;
 
 /// The number of lines that stay on the screen after C-v or M-v, as Emacs
 /// `next-screen-context-lines`.
 const page_context_lines = 2;
-
-const buffer_list_name = "*Buffer List*";
 
 /// A buffer in the buffer list: a `Buffer` with a name, its syntax tree and
 /// an optional keymap that works only in it.
@@ -293,6 +279,8 @@ pub const BufferEntry = struct {
     syntax: ?ts.Syntax = null,
     /// Keys that work only in this buffer, for example from Lua `buf:bind`.
     keymap: ?*Keymap = null,
+    /// Options that this buffer sets, for example from Lua `buf:set_option`.
+    options: options.Overrides = .{},
 };
 
 /// The settings of a floating window. The position and size are in screen
@@ -324,7 +312,6 @@ pub const Window = struct {
     /// Lua: a function that draws on the window after its text.
     on_draw: ?c_int = null,
 };
-
 
 /// What RET does with the minibuffer input. Each caller gives the action
 /// as a function, so one prompt needs no code in other places.
@@ -438,6 +425,13 @@ pub const Editor = struct {
     color_pairs: std.ArrayList([2]face.Color) = .empty,
     /// Lua: a function that gives the mode line text of a window.
     mode_line_fn: ?c_int = null,
+    /// The global options. A buffer can override them.
+    options: options.Options = .{},
+    /// The thread for background work on buffer text, for example syntax
+    /// trees. The editor makes it when the first buffer needs it.
+    executor: ?*text_worker.Executor = null,
+    /// Lua functions for `editor.on("buffer_open", fn)`, as registry references.
+    buffer_open_hooks: std.ArrayList(c_int) = .empty,
     /// The window that a Lua `on_draw` function draws on now. A canvas
     /// works only during its window's function.
     drawing_window: ?u32 = null,
@@ -449,8 +443,6 @@ pub const Editor = struct {
     separators: std.ArrayList(layout.Separator) = .empty,
     /// The buffer that C-x k asks about, while the yes or no question is open.
     pending_kill: ?u32 = null,
-    /// The buffer ID of each line of the buffer list, after the header line.
-    buffer_list_ids: std.ArrayList(u32) = .empty,
     /// The prefix argument while the user types it (C-u 12 ...).
     prefix_arg: ?PrefixArg = null,
     /// The active incremental search.
@@ -561,17 +553,20 @@ pub const Editor = struct {
     }
 
     pub fn deinit(self: *Editor) void {
+        for (self.buffer_open_hooks.items) |ref| self.freeLuaRef(ref);
+        self.buffer_open_hooks.deinit(self.gpa);
         if (self.search) |*s| s.deinit();
         if (self.reader) |*r| freeReader(self.gpa, r);
         self.histories.deinit();
         self.kill_ring.deinit();
         self.deinitLists();
+        // After the buffers: their syntax workers use the executor.
+        if (self.executor) |ex| ex.destroy();
         self.layout.deinit();
         self.faces.deinit();
         self.attr_cache.deinit(self.gpa);
         self.color_pairs.deinit(self.gpa);
         self.separators.deinit(self.gpa);
-        self.buffer_list_ids.deinit(self.gpa);
     }
 
     fn deinitLists(self: *Editor) void {
@@ -711,7 +706,7 @@ pub const Editor = struct {
                 while (i < @abs(n)) : (i += 1) {
                     _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, ref);
                     if (c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK) {
-                        c.lua_settop(L, -2); // pop the error message
+                        lua_api.showError(self, L, "command"); // pops the message
                         break;
                     }
                 }
@@ -739,7 +734,7 @@ pub const Editor = struct {
             .scroll_up_command => self.scrollCommand(true, arg),
             .scroll_down_command => self.scrollCommand(false, arg),
             .newline => buf.insert("\n"),
-            .tab_to_tab_stop => buf.insert("\t"),
+            .tab_to_tab_stop => self.tabToTabStop(buf, arg),
             .delete_backward_char => buf.deleteBackward(),
             .delete_char => buf.deleteForward(),
             .kill_line => self.killLine(isKill(prev), arg),
@@ -774,17 +769,12 @@ pub const Editor = struct {
             .execute_extended_command => self.executeExtendedCommand(arg),
             .switch_to_buffer => self.switchToBufferCommand(),
             .kill_buffer => self.killBufferCommand(),
-            .list_buffers => self.listBuffers(),
             .split_window_below => if (self.splitWindow(.below)) |_| {} else |err| err,
             .split_window_right => if (self.splitWindow(.right)) |_| {} else |err| err,
             .other_window => self.otherWindow(),
             .delete_window => self.deleteWindow(self.selected),
             .delete_other_windows => self.deleteOtherWindows(),
             .quit_window => self.quitWindow(),
-            .buffer_menu_this_window => self.bufferMenuThisWindow(),
-            .buffer_menu_other_window => self.bufferMenuOtherWindow(true),
-            .buffer_menu_switch_other_window => self.bufferMenuOtherWindow(false),
-            .buffer_menu_refresh => self.bufferMenuRefresh(),
         };
         result catch |err| {
             self.reportError(err);
@@ -1056,17 +1046,29 @@ pub const Editor = struct {
         try self.readFileName("Find file: ", findFile);
     }
 
-    /// Shows the file `path` in the selected window. If a buffer visits the
-    /// file, it uses that buffer. If the file does not exist, the buffer is
-    /// empty, and the first save makes the file.
-    pub fn findFile(self: *Editor, path: []const u8) anyerror!void {
+    pub const OpenedFile = struct {
+        entry: *BufferEntry,
+        /// True if this call made the buffer. Then the caller calls
+        /// `bufferOpened` after its own work on the buffer.
+        new: bool,
+        /// True if the file does not exist yet. The first save makes it.
+        missing: bool,
+    };
+
+    /// The buffer that visits the file `path`: a buffer that visits it
+    /// already, or a new buffer with the file text and its language. It
+    /// does not show the buffer, and it does not call the hooks. An error
+    /// if the file cannot be read.
+    pub fn openFileBuffer(self: *Editor, given_path: []const u8) !OpenedFile {
+        // Buffers keep absolute paths, so "a.txt" and "/dir/a.txt" find
+        // the same buffer.
+        const path = try self.absolutePath(given_path);
+        defer self.gpa.free(path);
         for (self.buffers.items) |e| {
             const p = e.buf.file_path orelse continue;
-            if (std.mem.eql(u8, p, path)) return self.showBuffer(self.selected, e);
+            if (std.mem.eql(u8, p, path)) return .{ .entry = e, .new = false, .missing = false };
         }
-        const text = files.readFile(self.io, Io.Dir.cwd(), self.gpa, path) catch |err| {
-            return self.setMessage("Cannot open {s}: {t}", .{ path, err });
-        };
+        const text = try files.readFile(self.io, Io.Dir.cwd(), self.gpa, path);
         defer if (text) |t| self.gpa.free(t);
 
         var new_buf: Buffer = if (text) |t| try .initText(self.gpa, t) else .init(self.gpa);
@@ -1076,9 +1078,33 @@ pub const Editor = struct {
         };
         const e = try self.addBuffer(std.fs.path.basename(path), new_buf);
         self.attachSyntax(e);
-        try self.showBuffer(self.selected, e);
+        return .{ .entry = e, .new = true, .missing = text == null };
+    }
+
+    /// `path` as an absolute path without "." and ".." parts, from the
+    /// current directory. Two paths for the same file then compare equal,
+    /// except through symbolic links. The caller frees it.
+    pub fn absolutePath(self: *Editor, path: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(path)) return std.fs.path.resolveAlloc(self.gpa, &.{path});
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try Io.Dir.cwd().realPath(self.io, &cwd_buf);
+        return std.fs.path.resolveAlloc(self.gpa, &.{ cwd_buf[0..n], path });
+    }
+
+    /// Shows the file `path` in the selected window. If a buffer visits the
+    /// file, it uses that buffer. If the file does not exist, the buffer is
+    /// empty, and the first save makes the file.
+    pub fn findFile(self: *Editor, path: []const u8) anyerror!void {
+        const opened = self.openFileBuffer(path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return self.setMessage("Cannot open {s}: {t}", .{ path, err }),
+        };
+        try self.showBuffer(self.selected, opened.entry);
+        if (!opened.new) return;
         self.last_command = null;
-        if (text == null) self.setMessage("(New file)", .{});
+        if (opened.missing) self.setMessage("(New file)", .{});
+        // Last: a hook can kill the buffer, so the entry is not used after it.
+        self.bufferOpened(opened.entry.id);
     }
 
     /// Opens a buffer for each file. The selected window shows the first
@@ -1107,9 +1133,20 @@ pub const Editor = struct {
         const lang = self.languages.load(self.io, cfg) catch {
             return self.setMessage("Cannot load language {s}: {s}", .{ cfg.name, self.languages.lastError() });
         };
-        e.syntax = ts.Syntax.init(self.gpa, lang) catch |err| {
+        const executor = self.textExecutor() catch |err| {
             return self.setMessage("Cannot use language {s}: {t}", .{ cfg.name, err });
         };
+        e.syntax = ts.Syntax.init(executor, lang, &e.buf.rope) catch |err| {
+            return self.setMessage("Cannot use language {s}: {t}", .{ cfg.name, err });
+        };
+    }
+
+    /// The executor for background work, made the first time.
+    fn textExecutor(self: *Editor) !*text_worker.Executor {
+        if (self.executor) |ex| return ex;
+        const ex = try text_worker.Executor.create(self.gpa, self.io);
+        self.executor = ex;
+        return ex;
     }
 
     /// Moves the cursor with a syntax tree function.
@@ -1118,7 +1155,7 @@ pub const Editor = struct {
             self.setMessage("No syntax tree for this buffer", .{});
             return error.NoSyntax;
         };
-        try syn.update(self.curBuf());
+        try syn.updateWait(self.curBuf());
         const pos = move(syn, self.curBuf().cursor) orelse return error.CannotMove;
         self.curBuf().moveTo(pos);
     }
@@ -1132,7 +1169,9 @@ pub const Editor = struct {
 
     /// Saves the buffer under a new name. The buffer gets the new file name
     /// as its name, and the new name can have a language.
-    fn saveAs(self: *Editor, path: []const u8) anyerror!void {
+    fn saveAs(self: *Editor, given_path: []const u8) anyerror!void {
+        const path = try self.absolutePath(given_path);
+        defer self.gpa.free(path);
         try self.curBuf().setFilePath(path);
         try self.writeFile();
         try self.renameBuffer(self.cur(), std.fs.path.basename(path));
@@ -1180,8 +1219,60 @@ pub const Editor = struct {
         return e;
     }
 
+    /// Makes an empty buffer. It does not call the `buffer_open` hooks: the
+    /// caller calls `bufferOpened` after its own work on the buffer.
     pub fn createBuffer(self: *Editor, name: []const u8) !*BufferEntry {
         return self.addBuffer(name, .init(self.gpa));
+    }
+
+    /// The options of a buffer: its overrides, then the global values.
+    pub fn optionsFor(self: *const Editor, e: *const BufferEntry) options.Options {
+        return options.resolve(self.options, e.options);
+    }
+
+    /// TAB: indents to the next indent level. With `indent_tabs`, it inserts
+    /// a tab character. Otherwise it inserts spaces up to the next multiple
+    /// of `indent_width`, so it lines up with other indented lines. With an
+    /// active region, it indents each line of the region by one level.
+    ///
+    /// A count (C-u 3 TAB) indents that many levels as one edit, so one
+    /// undo takes all of it away.
+    fn tabToTabStop(self: *Editor, buf: *Buffer, arg: ?PrefixArg) !void {
+        const count = if (arg) |a| a.count() else 1;
+        if (count < 0) return error.NegativeCount;
+        if (count == 0) return; // C-u 0 TAB does nothing
+        const levels: usize = @intCast(count);
+        // In the minibuffer, use the options of the selected buffer.
+        const o = self.optionsFor(self.cur());
+        const unit = options.indentUnit(o);
+        const in_region = buf.activeRegion() != null;
+        // Without a region and with spaces, the first level only goes to
+        // the next multiple of `indent_width`, so it lines up with other
+        // indented lines. The other levels are whole units.
+        const first: []const u8 = if (in_region or o.indent_tabs)
+            unit
+        else
+            options.spacesOf(o.indent_width - buf.displayColumn(buf.cursor, o.tab_width) % o.indent_width);
+        const text = try self.gpa.alloc(u8, first.len + (levels - 1) * unit.len);
+        defer self.gpa.free(text);
+        @memcpy(text[0..first.len], first);
+        var i = first.len;
+        while (i < text.len) : (i += unit.len) @memcpy(text[i..][0..unit.len], unit);
+
+        if (in_region) return buf.indentRegion(text);
+        try buf.insert(text);
+    }
+
+    /// Calls the `buffer_open` hooks for a new buffer. Call it last, after
+    /// all work on the buffer: a hook can change the buffer or kill it. A
+    /// hook can also add hooks, so the loop reads the length each time. If
+    /// a hook kills the buffer, the other hooks do not run.
+    pub fn bufferOpened(self: *Editor, id: u32) void {
+        var i: usize = 0;
+        while (i < self.buffer_open_hooks.items.len) : (i += 1) {
+            if (self.bufferById(id) == null) return;
+            lua_api.callBufferHook(self, self.buffer_open_hooks.items[i], id);
+        }
     }
 
     fn uniqueName(self: *const Editor, name: []const u8) ![]u8 {
@@ -1256,7 +1347,8 @@ pub const Editor = struct {
 
     /// Kills a buffer. A window that shows it shows another buffer, and a
     /// floating window that shows it closes. If it was the last buffer, a new
-    /// "*scratch*" buffer takes its place.
+    /// "*scratch*" buffer takes its place. That buffer does not get the
+    /// `buffer_open` hooks: a hook that kills it would make this recursive.
     pub fn killBuffer(self: *Editor, e: *BufferEntry) !void {
         if (self.search != null) self.endSearch();
         const i = std.mem.indexOfScalar(*BufferEntry, self.buffers.items, e) orelse return error.NoSuchBuffer;
@@ -1307,8 +1399,10 @@ pub const Editor = struct {
     }
 
     fn switchToBufferNamed(self: *Editor, name: []const u8) anyerror!void {
-        const e = self.findBuffer(name) orelse try self.createBuffer(name);
+        if (self.findBuffer(name)) |e| return self.showBuffer(self.selected, e);
+        const e = try self.createBuffer(name);
         try self.showBuffer(self.selected, e);
+        self.bufferOpened(e.id);
     }
 
     /// C-x k: kills a buffer by name. If it visits a file and has unsaved
@@ -1345,103 +1439,13 @@ pub const Editor = struct {
         try self.killBuffer(e);
     }
 
-    /// C-x C-b: shows the buffer list in another window, as Emacs
-    /// `list-buffers`. Keys in the list:
-    /// - RET: shows the buffer of the cursor line in this window.
-    /// - o: shows it in another window and selects that window.
-    /// - C-o: shows it in another window. The cursor stays in the list.
-    /// - n and p: the next and previous line. g: makes the list again.
-    /// - q: closes the window.
-    fn listBuffers(self: *Editor) !void {
-        const e = self.findBuffer(buffer_list_name) orelse blk: {
-            const new = try self.createBuffer(buffer_list_name);
-            new.buf.read_only = true;
-            const km = try self.gpa.create(Keymap);
-            km.* = .{};
-            new.keymap = km;
-            const list_keys = [_]struct { []const u8, Builtin }{
-                .{ "RET", .buffer_menu_this_window },
-                .{ "o", .buffer_menu_other_window },
-                .{ "C-o", .buffer_menu_switch_other_window },
-                .{ "g", .buffer_menu_refresh },
-                .{ "n", .next_line },
-                .{ "p", .previous_line },
-                .{ "q", .quit_window },
-            };
-            for (list_keys) |k| try km.bindKeys(self.gpa, k[0], .{ .builtin = k[1] });
-            break :blk new;
-        };
-        try self.fillBufferList(e, self.cur());
-        // Start on the first buffer line, below the header.
-        e.buf.moveTo(@min(e.buf.lineOffset(1), e.buf.len()));
-        try self.displayBuffer(e);
-    }
-
-    /// Writes the buffer list into `e`, and remembers the buffer of each
-    /// line in `buffer_list_ids`. `current` gets the "." mark.
-    fn fillBufferList(self: *Editor, e: *BufferEntry, current: ?*const BufferEntry) !void {
-        var text: std.Io.Writer.Allocating = .init(self.gpa);
-        defer text.deinit();
-        const w = &text.writer;
-        self.buffer_list_ids.clearRetainingCapacity();
-        try w.print(" MR {s:<24} {s:>8}  File\n", .{ "Buffer", "Size" });
-        for (self.buffers.items) |b| {
-            if (b == e) continue;
-            const mark: u8 = if (b == current) '.' else ' ';
-            const modified: u8 = if (b.buf.file_path != null and b.buf.isModified()) '*' else ' ';
-            const ro: u8 = if (b.buf.read_only) '%' else ' ';
-            try w.print("{c}{c}{c} {s:<24} {d:>8}  {s}\n", .{ mark, modified, ro, b.name, b.buf.len(), b.buf.file_path orelse "" });
-            try self.buffer_list_ids.append(self.gpa, b.id);
-        }
-        try e.buf.setText(text.written());
-        try e.buf.addHighlight(0, std.mem.indexOfScalar(u8, text.written(), '\n') orelse 0, face.Builtin.keyword.id());
-    }
-
-    /// The buffer on the cursor line of the buffer list. An error if the
-    /// selected window does not show the list, or if the line has no buffer.
-    fn bufferMenuTarget(self: *Editor) !*BufferEntry {
-        if (!std.mem.eql(u8, self.cur().name, buffer_list_name)) return error.NotInBufferList;
-        const line = self.curBuf().cursorLine();
-        if (line == 0 or line > self.buffer_list_ids.items.len) {
-            self.setMessage("No buffer on this line", .{});
-            return error.NoBufferOnLine;
-        }
-        return self.bufferById(self.buffer_list_ids.items[line - 1]) orelse {
-            self.setMessage("This buffer was killed; press g", .{});
-            return error.NoSuchBuffer;
-        };
-    }
-
-    /// RET in the buffer list: shows the buffer in the list's window.
-    fn bufferMenuThisWindow(self: *Editor) !void {
-        const target = try self.bufferMenuTarget();
-        try self.showBuffer(self.selected, target);
-    }
-
-    /// o and C-o in the buffer list: shows the buffer in another window.
-    /// `o` also selects that window.
-    fn bufferMenuOtherWindow(self: *Editor, select: bool) !void {
-        const target = try self.bufferMenuTarget();
-        const win = try self.windowForDisplay(self.selected);
-        try self.showBuffer(win, target);
-        if (select) self.selectWindow(win);
-    }
-
-    /// g in the buffer list: makes the list again, and keeps the cursor line.
-    fn bufferMenuRefresh(self: *Editor) !void {
-        const e = self.cur();
-        if (!std.mem.eql(u8, e.name, buffer_list_name)) return error.NotInBufferList;
-        const line = e.buf.cursorLine();
-        try self.fillBufferList(e, self.otherBuffer(e));
-        e.buf.moveTo(@min(e.buf.lineOffset(line), e.buf.len()));
-    }
-
-    /// A window to show a buffer in, other than `except`: the window that
-    /// was selected before, another split window, or a new split below
-    /// `except`. The selection does not change.
-    fn windowForDisplay(self: *Editor, except: *Window) !*Window {
+    /// A window to show a buffer in, other than `except`: the split window
+    /// that was selected before, another split window, or a new split below
+    /// `except`. It does not use floating windows. The selection does not
+    /// change.
+    pub fn windowForDisplay(self: *Editor, except: *Window) !*Window {
         if (self.previous_window) |id| if (self.windowById(id)) |w| {
-            if (w != except) return w;
+            if (w != except and w.float == null) return w;
         };
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(self.gpa);
@@ -1451,23 +1455,6 @@ pub const Editor = struct {
         self.selected = except;
         defer self.selected = old;
         return self.splitWindow(.below);
-    }
-
-    /// Shows a buffer in a window that is not the selected window, as Emacs
-    /// `display-buffer`. With one window, it splits the window first.
-    pub fn displayBuffer(self: *Editor, e: *BufferEntry) !void {
-        for (self.windows.items) |w| if (w.entry == e) return; // visible already
-        var ids: std.ArrayList(u32) = .empty;
-        defer ids.deinit(self.gpa);
-        try self.layout.leaves(&ids);
-        const target = blk: {
-            for (ids.items) |id| if (id != self.selected.id) break :blk self.windowById(id).?;
-            const old = self.selected;
-            const win = try self.splitWindow(.below);
-            self.selected = old;
-            break :blk win;
-        };
-        try self.showBuffer(target, e);
     }
 
     // Windows
@@ -1790,7 +1777,7 @@ pub const Editor = struct {
     }
 
     /// Scrolls a window so that `point` is in its text area.
-    fn scrollWindow(win: *Window, point: usize, text: layout.Rect) void {
+    fn scrollWindow(win: *Window, point: usize, text: layout.Rect, tab_width: usize) void {
         const b = &win.entry.buf;
         const line = b.lineOf(point);
         if (line < win.top) win.top = line;
@@ -1884,7 +1871,8 @@ pub const Editor = struct {
 
         if (text.rows > 0 and text.cols > 0) {
             const point = if (selected) b.cursor else @min(win.point, b.len());
-            scrollWindow(win, point, text);
+            const tab_width: usize = self.optionsFor(e).tab_width;
+            scrollWindow(win, point, text, tab_width);
             const region = if (selected) b.activeRegion() else null;
 
             // Faces for the visible bytes only.
@@ -1993,6 +1981,7 @@ pub const Editor = struct {
         const attr = self.faceAttr(if (selected) face.Builtin.mode_line.id() else face.Builtin.mode_line_inactive.id());
         const b = &win.entry.buf;
         const point = if (selected) b.cursor else @min(win.point, b.len());
+        const tab_width: usize = self.optionsFor(win.entry).tab_width;
 
         var text_buf: [512]u8 = undefined;
         const text = lua_api.modeLineText(self, win, &text_buf) orelse blk: {
@@ -2201,9 +2190,42 @@ fn configPath(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?[
     return try std.fs.path.joinZ(arena, &.{ home, ".config", "editor-zig", "init.lua" });
 }
 
+/// Lets `require` find modules in the directory of the config file:
+/// `require("foo")` loads `<dir>/foo.lua` or `<dir>/foo/init.lua`, and
+/// `require("a.b")` loads `<dir>/a/b.lua`. C modules load from `<dir>/?.so`.
+/// The directory comes before the default paths, so its modules win.
+///
+/// Lua path templates use ";" between templates and "?" for the module
+/// name, and they have no escape. A directory with one of these characters
+/// cannot be in the path, so this returns error.UnusableConfigDir.
+fn addConfigDirToPath(L: *c.lua_State, dir: []const u8) !void {
+    if (std.mem.indexOfAny(u8, dir, ";?") != null) return error.UnusableConfigDir;
+    _ = c.lua_getglobal(L, "package");
+    defer c.lua_settop(L, -2); // pop `package`
+    prependSearchPath(L, "path", dir, &.{ "?.lua", "?/init.lua" });
+    prependSearchPath(L, "cpath", dir, &.{"?.so"});
+}
+
+/// Sets `package[field]` to "<dir>/<pattern>;" for each pattern, then the
+/// old value. `package` must be on the top of the stack.
+fn prependSearchPath(L: *c.lua_State, comptime field: [:0]const u8, dir: []const u8, comptime patterns: []const []const u8) void {
+    inline for (patterns) |pattern| {
+        _ = c.lua_pushlstring(L, dir.ptr, dir.len);
+        _ = c.lua_pushstring(L, "/" ++ pattern ++ ";");
+    }
+    // `package` is below the strings.
+    _ = c.lua_getfield(L, -1 - 2 * @as(c_int, patterns.len), field);
+    c.lua_concat(L, 2 * patterns.len + 1);
+    c.lua_setfield(L, -2, field);
+}
+
 /// Loads and runs the config file. If the file is missing or has an error,
 /// the editor starts without it, and an error shows in the echo area.
+/// Modules next to the file load with `require`.
 fn loadConfig(editor: *Editor, L: *c.lua_State, path: [:0]const u8) void {
+    if (std.fs.path.dirname(path)) |dir| addConfigDirToPath(L, dir) catch {
+        editor.setMessage("init.lua: require cannot find modules in {s}: its path has \";\" or \"?\"", .{dir});
+    };
     if (c.luaL_loadfilex(L, path.ptr, null) != c.LUA_OK or
         c.lua_pcallk(L, 0, 0, 0, 0, null) != c.LUA_OK)
     {
@@ -2358,6 +2380,8 @@ test {
     _ = @import("completion.zig");
     _ = @import("regex.zig");
     _ = @import("syntax.zig");
+    _ = @import("text_worker.zig");
+    _ = options;
     _ = @import("prefix_arg.zig");
     _ = @import("isearch.zig");
     _ = @import("history.zig");
@@ -2570,6 +2594,56 @@ test "editor: a yes or no question" {
     try testing.expect(!t.ed.running);
 }
 
+test "a config directory with \";\" or \"?\" is not added to the require path" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a;b");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a;b/init.lua", .data = "loaded = true" });
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.joinZ(testing.allocator, &.{ dir, "a;b", "init.lua" });
+    defer testing.allocator.free(path);
+    loadConfig(&t.ed, t.L.?, path);
+    try testing.expect(std.mem.indexOf(u8, t.message(), "require cannot find modules") != null);
+    try t.lua(
+        \\assert(loaded == true) -- the file still runs
+        \\assert(not package.path:find("a;b", 1, true))
+    );
+}
+
+test "init.lua can require modules from its own directory" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "pkg");
+    try tmp.dir.createDirPath(testing.io, "a");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "mod.lua", .data = "return { name = 'mod' }" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "pkg/init.lua", .data = "return { name = 'pkg' }" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a/b.lua", .data = "return { name = 'a.b' }" });
+    // A file with the name of a standard library module does not replace
+    // it, because `package.loaded` has the library before init.lua runs.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "string.lua", .data = "return 'not loaded'" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "init.lua", .data =
+        \\found = require("mod").name .. " " .. require("pkg").name .. " " .. require("a.b").name
+    });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.joinZ(testing.allocator, &.{ dir, "init.lua" });
+    defer testing.allocator.free(path);
+    loadConfig(&t.ed, t.L.?, path);
+
+    try testing.expectEqualStrings("", t.message()); // no error
+    try t.lua(
+        \\assert(found == "mod pkg a.b", tostring(found))
+        \\-- The standard library is already loaded, so require gives it.
+        \\assert(require("string") == string)
+    );
+}
+
 test "editor: open and save files with prompts, completion and history" {
     const t = try TestEditor.create();
     defer t.destroy();
@@ -2751,32 +2825,6 @@ test "editor: files open in their own buffers, with unique names" {
     try testing.expectEqual(3, t.ed.buffers.items.len); // *scratch* and two files
 }
 
-test "editor: the buffer list is read-only, and q closes its window" {
-    const t = try TestEditor.create();
-    defer t.destroy();
-    try t.press("C-x b");
-    try t.typeText("other");
-    try t.press("RET");
-    try t.press("C-x C-b");
-    try testing.expectEqual(2, tiledCount(t)); // the list shows in a new window
-    try testing.expectEqualStrings("other", t.ed.cur().name); // the selection does not move
-
-    const list = t.ed.findBuffer("*Buffer List*").?;
-    const text = try list.buf.copyRange(testing.allocator, 0, list.buf.len());
-    defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, ".   other") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "*scratch*") != null);
-
-    try t.press("C-x o");
-    try testing.expectEqual(list, t.ed.cur());
-    const bells = t.ed.bells;
-    try t.typeText("z"); // read-only
-    try testing.expectEqual(bells + 1, t.ed.bells);
-    try testing.expectEqualStrings("Buffer is read-only", t.message());
-    try t.press("q");
-    try testing.expectEqual(1, tiledCount(t));
-}
-
 test "lua: buffers, highlights, faces and handles" {
     const t = try TestEditor.createWithLua();
     defer t.destroy();
@@ -2847,6 +2895,237 @@ test "lua: split and float windows, buffer keys and the mode line" {
     try testing.expectEqual(1, tiledCount(t));
 }
 
+test "lua: insert, sub, delete, undo groups, region and path" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    try t.lua(
+        \\local b = editor.buffer.current()
+        \\b:set_text("hello world")
+        \\b:set_cursor(5)
+        \\b:insert(",")
+        \\assert(b:cursor() == 6)
+        \\assert(b:sub(0, 6) == "hello,")
+        \\assert(b:sub(10, 100) == "ld")    -- clamped to the text
+        \\assert(b:sub(-5, 2) == "he")
+        \\assert(b:sub(12, 13) == "")
+        \\b:delete(0, 1)
+        \\assert(b:sub(0, 5) == "ello,")
+        \\assert(b:cursor() == 5)           -- moved with the text
+        \\assert(b:path() == nil)
+        \\b:append("\nnext line")
+        \\local s, e = b:line_range(3)
+        \\assert(s == 0 and e == 11, s .. " " .. e)
+        \\s, e = b:line_range(14)
+        \\assert(s == 12 and e == 21, s .. " " .. e)
+        \\assert(b:line_range(999) == 12)   -- clamped
+        \\b:delete(11, 21)
+        \\assert(b:region() == nil)
+        \\assert(b:nodes_at(0) == nil)      -- no syntax tree
+    );
+    try t.expectText("ello, world");
+    try testing.expect(try t.luaFails("editor.buffer.current():delete(3, 1)", "invalid range"));
+
+    // An undo group is one undo step, also with an error inside it.
+    try t.lua(
+        \\local b = editor.buffer.current()
+        \\b:set_cursor(0)
+        \\b:undo_group(function()
+        \\  b:insert("(")
+        \\  b:set_cursor(b:cursor() + 4)
+        \\  b:insert(")")
+        \\end)
+    );
+    try t.expectText("(ello), world");
+    try t.press("C-/");
+    try t.expectText("ello, world");
+    try testing.expect(try t.luaFails(
+        \\local b = editor.buffer.current()
+        \\b:undo_group(function() b:insert("x") error("stop") end)
+    , "stop"));
+    try t.typeText("y"); // the group ended, so typing is a new step
+    try t.press("C-/");
+    try t.expectText("xello, world");
+
+    // The active region.
+    t.ed.curBuf().moveTo(1);
+    try t.press("C-SPC");
+    t.ed.curBuf().moveTo(5);
+    try t.lua(
+        \\local s, e = editor.buffer.current():region()
+        \\assert(s == 1 and e == 5, tostring(s) .. " " .. tostring(e))
+    );
+}
+
+test "editor: TAB indents to the next level of indent_width" {
+    const t = try TestEditor.create();
+    defer t.destroy();
+    try t.press("TAB"); // default: 4 spaces
+    try t.expectText("    ");
+    try t.typeText("ab");
+    try t.press("TAB"); // from column 6 to column 8
+    try t.expectText("    ab  ");
+    try t.press("C-u 2 TAB");
+    try t.expectText("    ab          ");
+    const bells = t.ed.bells;
+    try t.press("C-u 0 TAB"); // nothing, and no error
+    try t.expectText("    ab          ");
+    try testing.expectEqual(bells, t.ed.bells);
+
+    t.ed.options.indent_width = 2;
+    t.ed.curBuf().moveTo(0);
+    try t.press("TAB");
+    try t.expectText("      ab          ");
+
+    t.ed.cur().options.indent_tabs = true; // a buffer override
+    try t.press("TAB");
+    try t.expectText("  \t    ab          ");
+    try t.press("C-/"); // one TAB is one undo step
+    try t.expectText("      ab          ");
+
+    // With a region, TAB indents each line of it.
+    t.ed.cur().options.indent_tabs = null;
+    try t.ed.curBuf().setText("x\ny\nz");
+    t.ed.curBuf().moveTo(0);
+    try t.press("C-SPC");
+    t.ed.curBuf().moveTo(3); // in line "y"
+    try t.press("TAB");
+    try t.expectText("  x\n  y\nz");
+    try t.press("C-u 2 TAB"); // the region stays; two levels in one edit
+    try t.expectText("      x\n      y\nz");
+    try t.press("C-/");
+    try t.expectText("  x\n  y\nz");
+}
+
+test "lua: editor.options and buffer options" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    try t.lua(
+        \\assert(editor.options.indent_width == 4)
+        \\assert(editor.options.indent_tabs == false)
+        \\assert(editor.options.tab_width == 8)
+        \\editor.options.indent_width = 2
+        \\editor.options.tab_width = 4
+        \\local b = editor.buffer.current()
+        \\assert(b:option("indent_width") == 2)  -- the global value
+        \\b:set_option("indent_width", 3)
+        \\b:set_option("indent_tabs", true)
+        \\assert(b:option("indent_width") == 3)
+        \\assert(b:option("indent_tabs") == true)
+        \\assert(editor.options.indent_width == 2) -- the global value stays
+        \\local other = editor.buffer.create("other")
+        \\assert(other:option("indent_width") == 2)
+        \\b:set_option("indent_width", nil)
+        \\assert(b:option("indent_width") == 2)
+    );
+    try testing.expectEqual(2, t.ed.options.indent_width);
+    try testing.expectEqual(4, t.ed.options.tab_width);
+    try testing.expectEqual(true, t.ed.cur().options.indent_tabs.?);
+
+    try testing.expect(try t.luaFails("editor.options.indent_widht = 2", "unknown option"));
+    try testing.expect(try t.luaFails("print(editor.options.nope)", "unknown option"));
+    try testing.expect(try t.luaFails("editor.options.indent_width = 0", "from 1 to 16"));
+    try testing.expect(try t.luaFails("editor.options.indent_width = 2.5", "integer"));
+    try testing.expect(try t.luaFails("editor.options.indent_tabs = 1", "true or false"));
+    try testing.expect(try t.luaFails("editor.buffer.current():set_option('tab_width', 99)", "from 1 to 16"));
+    try testing.expectEqual(2, t.ed.options.indent_width); // the errors changed nothing
+}
+
+test "lua: a buffer_open hook can kill or change the new buffer safely" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    // A hook that kills some buffers, and one that binds a key in all.
+    try t.lua(
+        \\seen = {}
+        \\editor.on("buffer_open", function(buf)
+        \\  table.insert(seen, buf:name() .. (buf:valid() and "" or "!"))
+        \\  if buf:name():match("^tmp") or buf:name() == "f.txt" then buf:kill() end
+        \\end)
+        \\editor.on("buffer_open", function(buf)
+        \\  buf:bind("C-c x", function() end)
+        \\  table.insert(seen, "second:" .. buf:name())
+        \\end)
+        \\local b = editor.buffer.create{ name = "tmp1", read_only = true }
+        \\assert(not b:valid())
+        \\local k = editor.buffer.create{ name = "keep", read_only = true }
+        \\assert(k:valid())
+    );
+    // The second hook did not run for the killed buffer, and the first hook
+    // saw the read-only flag that create set.
+    try t.lua(
+        \\assert(table.concat(seen, ",") == "tmp1,keep,second:keep", table.concat(seen, ","))
+    );
+    try testing.expect(t.ed.findBuffer("keep").?.buf.read_only);
+
+    // findFile: the hook kills the file buffer. The window shows another
+    // buffer, and nothing uses the freed entry.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f.txt", .data = "x" });
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "f.txt" });
+    defer testing.allocator.free(path);
+    try t.ed.findFile(path);
+    try testing.expectEqual(null, t.ed.findBuffer("f.txt"));
+    try testing.expect(!std.mem.eql(u8, "f.txt", t.ed.cur().name));
+    t.ed.render();
+
+    // Killing the last buffers: the replacement *scratch* gets no hooks, so
+    // a hook that kills new buffers cannot make the kill recursive.
+    try t.lua(
+        \\editor.on("buffer_open", function(buf) buf:kill() end)
+        \\for _, b in ipairs(editor.buffer.list()) do b:kill() end
+        \\assert(#editor.buffer.list() == 1)
+        \\assert(editor.buffer.list()[1]:name() == "*scratch*")
+    );
+}
+
+test "lua: buffer_open hooks and errors in commands" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    try t.lua(
+        \\opened = {}
+        \\editor.on("buffer_open", function(buf)
+        \\  table.insert(opened, buf:name())
+        \\  buf:bind("(", function() buf:insert("()") buf:set_cursor(buf:cursor() - 1) end)
+        \\end)
+    );
+    try testing.expect(try t.luaFails("editor.on('nope', print)", "unknown event"));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f.txt", .data = "ab" });
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "f.txt" });
+    defer testing.allocator.free(path);
+    try t.ed.findFile(path);
+    try t.lua(
+        \\assert(#opened == 1 and opened[1] == "f.txt", table.concat(opened, ","))
+        \\assert(editor.buffer.current():path():sub(-5) == "f.txt")
+        \\editor.buffer.create("other")
+        \\assert(#opened == 2 and opened[2] == "other")
+    );
+
+    // The buffer key from the hook works in the file buffer.
+    try t.typeText("(x");
+    try t.expectText("(x)ab");
+
+    // In the minibuffer, the buffer key does not apply.
+    try t.press("C-x C-f");
+    try t.typeText("(");
+    const mb = &t.ed.reader.?.mb.buffer;
+    const prompt = try mb.copyRange(testing.allocator, 0, mb.len());
+    defer testing.allocator.free(prompt);
+    try testing.expect(std.mem.endsWith(u8, prompt, "(")); // no ")" after it
+    try t.press("C-g");
+
+    // An error in a Lua command shows in the echo area.
+    try t.lua("editor.bind('C-c e', function() error('broken plugin') end)");
+    try t.press("C-c e");
+    try testing.expect(std.mem.indexOf(u8, t.message(), "broken plugin") != null);
+}
+
 test "editor: openFiles opens a buffer for each file, the first one shown" {
     const t = try TestEditor.create();
     defer t.destroy();
@@ -2877,61 +3156,61 @@ test "editor: openFiles opens a buffer for each file, the first one shown" {
     try testing.expectEqualStrings("b.txt", t.ed.cur().name);
 }
 
-test "editor: pick a buffer from the buffer list" {
-    const t = try TestEditor.create();
+test "lua: buffer.open, window.display, buffer info and equal handles" {
+    const t = try TestEditor.createWithLua();
     defer t.destroy();
-    try t.press("C-x b");
-    try t.typeText("my notes"); // a name with a space
-    try t.press("RET");
-    try t.press("C-x b");
-    try t.typeText("todo");
-    try t.press("RET");
-    const todo_win = t.ed.selected;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "hello" });
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    try t.lua("opened = 0; editor.on('buffer_open', function() opened = opened + 1 end)");
 
-    try t.press("C-x C-b C-x o"); // into the list
-    try testing.expectEqualStrings("*Buffer List*", t.ed.cur().name);
-    // The list is: todo, my notes, *scratch*. The cursor starts on "todo".
-    try testing.expectEqual(1, t.ed.curBuf().cursorLine());
-
-    // C-o: show "my notes" in the other window, and stay in the list.
-    try t.press("n C-o");
-    try testing.expectEqualStrings("*Buffer List*", t.ed.cur().name);
-    try testing.expectEqualStrings("my notes", todo_win.entry.name);
-
-    // o: show "*scratch*" in the other window, and select it.
-    try t.press("n o");
-    try testing.expectEqual(todo_win, t.ed.selected);
-    try testing.expectEqualStrings("*scratch*", t.ed.cur().name);
-
-    // RET: show the buffer in the list's own window.
-    try t.press("C-x o p p");
-    try testing.expectEqual(1, t.ed.curBuf().cursorLine());
-    try t.press("RET");
-    try testing.expectEqualStrings("todo", t.ed.cur().name);
+    var code_buf: [std.fs.max_path_bytes + 2048]u8 = undefined;
+    const code = try std.fmt.bufPrintSentinel(&code_buf,
+        \\local dir = "{s}"
+        \\local a = editor.buffer.open(dir .. "/a.txt")
+        \\assert(a:name() == "a.txt" and a:sub(0, 5) == "hello")
+        \\assert(a:path() == dir .. "/a.txt")
+        \\assert(a:len() == 5 and not a:modified() and not a:read_only())
+        \\assert(editor.buffer.current():name() == "*scratch*") -- not shown
+        \\assert(opened == 1)
+        \\-- The same file again gives the same buffer, without the hooks.
+        \\assert(editor.buffer.open(dir .. "/a.txt") == a)
+        \\assert(opened == 1)
+        \\-- A file that does not exist gives an empty buffer.
+        \\local n = editor.buffer.open(dir .. "/new.txt")
+        \\assert(n:len() == 0 and n:path() == dir .. "/new.txt")
+        \\assert(opened == 2)
+        \\a:insert("x")
+        \\assert(a:modified())
+        \\local ro = editor.buffer.create{{ name = "ro", read_only = true }}
+        \\assert(ro:read_only())
+        \\
+        \\-- Handles: equal for the same buffer or window, not across types.
+        \\assert(editor.buffer.get("a.txt") == a and a ~= n)
+        \\assert(editor.window.current() == editor.window.current())
+        \\assert(editor.window.current() ~= a)
+        \\
+        \\-- display: a split below, the selection stays; then the same window.
+        \\local here = editor.window.current()
+        \\local w = editor.window.display(a)
+        \\assert(w ~= here and editor.window.current() == here)
+        \\assert(w:buffer() == a)
+        \\assert(editor.window.display(a) == w) -- shown already
+        \\local w2 = editor.window.display(n) -- the other window again
+        \\assert(w2 == w and w:buffer() == n)
+        \\-- A path with ".." finds the same buffer.
+        \\assert(editor.buffer.open(dir .. "/sub/../a.txt") == a)
+        \\-- display does not use a floating window that was selected before.
+        \\local f = editor.window.float{{ buffer = n, row = 1, col = 1, width = 10, height = 3 }}
+        \\here:focus()
+        \\local w3 = editor.window.display(ro)
+        \\assert(w3 ~= f and w3:buffer() == ro)
+    , .{dir}, 0);
+    try t.lua(code);
     try testing.expectEqual(2, tiledCount(t));
-}
-
-test "editor: the buffer list keys handle the header, killed buffers and g" {
-    const t = try TestEditor.create();
-    defer t.destroy();
-    try t.press("C-x b");
-    try t.typeText("gone");
-    try t.press("RET C-x b RET"); // back to *scratch*
-    try t.press("C-x C-b C-x o");
-
-    try t.press("p RET"); // the header line has no buffer
-    try testing.expectEqualStrings("No buffer on this line", t.message());
-    try testing.expectEqualStrings("*Buffer List*", t.ed.cur().name);
-
-    t.ed.killBuffer(t.ed.findBuffer("gone").?) catch unreachable;
-    try t.press("n n RET"); // "gone" was on line 2
-    try testing.expectEqualStrings("This buffer was killed; press g", t.message());
-
-    try t.press("g"); // the list again, without "gone"
-    const list = t.ed.cur();
-    const text = try list.buf.copyRange(testing.allocator, 0, list.buf.len());
-    defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "gone") == null);
-    try testing.expectEqual(1, t.ed.buffer_list_ids.items.len);
-    try testing.expectEqual(2, t.ed.curBuf().cursorLine()); // the same line
+    // A directory cannot be read as a file.
+    const bad = try std.fmt.bufPrintSentinel(&code_buf, "editor.buffer.open(\"{s}\")", .{dir}, 0);
+    try testing.expect(try t.luaFails(bad, "editor.buffer.open"));
 }

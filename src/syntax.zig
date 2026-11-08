@@ -13,6 +13,10 @@ const c = @import("c");
 const regex = @import("regex.zig");
 const files = @import("files.zig");
 const Buffer = @import("buffer.zig").Buffer;
+const rope_zig = @import("rope");
+const Rope = rope_zig.Rope;
+const Snapshot = rope_zig.Snapshot;
+const text_worker = @import("text_worker.zig");
 
 /// The color groups for highlighting. Query capture names map to these.
 pub const Face = enum(u8) {
@@ -145,22 +149,30 @@ pub const Highlights = struct {
         gpa.free(patterns);
     }
 
-    /// True if the match passes all predicates of its pattern.
-    fn passes(self: *const Highlights, match: *const c.TSQueryMatch, text: []const u8) bool {
+    /// True if the match passes all predicates of its pattern. It reads the
+    /// node text from `snap` into `scratch`.
+    fn passes(self: *const Highlights, match: *const c.TSQueryMatch, snap: Snapshot, gpa: std.mem.Allocator, scratch: *std.ArrayList(u8)) !bool {
         const pattern = self.patterns[match.pattern_index];
         if (pattern.disabled) return false;
         const captures = match.captures[0..match.capture_count];
         for (pattern.predicates) |pred| {
             // As in Neovim, a predicate on a capture that did not match passes.
-            const node_text = captureText(captures, pred.capture, text) orelse continue;
+            const range = captureRange(captures, pred.capture, snap.len()) orelse continue;
+            scratch.clearRetainingCapacity();
+            try appendRange(gpa, scratch, snap, range);
             const result = switch (pred.kind) {
                 .eq => blk: {
-                    const other = if (pred.other_capture) |id| captureText(captures, id, text) orelse continue else pred.string;
-                    break :blk std.mem.eql(u8, node_text, other);
+                    if (pred.other_capture) |id| {
+                        const other = captureRange(captures, id, snap.len()) orelse continue;
+                        const split = scratch.items.len;
+                        try appendRange(gpa, scratch, snap, other);
+                        break :blk std.mem.eql(u8, scratch.items[0..split], scratch.items[split..]);
+                    }
+                    break :blk std.mem.eql(u8, scratch.items, pred.string);
                 },
-                .match => regex.isMatch(pred.string, pred.syntax, node_text),
+                .match => regex.isMatch(pred.string, pred.syntax, scratch.items),
                 .any_of => blk: {
-                    for (pred.strings) |s| if (std.mem.eql(u8, node_text, s)) break :blk true;
+                    for (pred.strings) |str| if (std.mem.eql(u8, scratch.items, str)) break :blk true;
                     break :blk false;
                 },
             };
@@ -170,15 +182,22 @@ pub const Highlights = struct {
     }
 };
 
-fn captureText(captures: []const c.TSQueryCapture, id: u32, text: []const u8) ?[]const u8 {
+const ByteRange = struct { start: usize, end: usize };
+
+fn captureRange(captures: []const c.TSQueryCapture, id: u32, len: usize) ?ByteRange {
     for (captures) |cap| {
         if (cap.index != id) continue;
         const start = c.ts_node_start_byte(cap.node);
         const end = c.ts_node_end_byte(cap.node);
-        if (end > text.len or start > end) return null;
-        return text[start..end];
+        if (end > len or start > end) return null;
+        return .{ .start = start, .end = end };
     }
     return null;
+}
+
+fn appendRange(gpa: std.mem.Allocator, list: *std.ArrayList(u8), snap: Snapshot, range: ByteRange) !void {
+    const out = try list.addManyAsSlice(gpa, range.end - range.start);
+    snap.copyRange(range.start, out);
 }
 
 fn queryErrorName(err: c.TSQueryError) []const u8 {
@@ -492,44 +511,284 @@ fn freeAll(gpa: std.mem.Allocator, items: [][]u8) void {
 
 // Syntax trees
 
-/// The parser and the syntax tree of one buffer.
+/// The tree-sitter job for a `text_worker.Worker`. It keeps the last tree
+/// and its snapshot. For each new snapshot, it finds the changed range with
+/// `Snapshot.diff`, tells the old tree about it with `ts_tree_edit`, and
+/// gives the old tree to the parser. The parser then reuses the parts that
+/// did not change. The parser reads the snapshot directly, without a copy.
+const ParseJob = struct {
+    parser: *c.TSParser,
+    old: ?struct { tree: *c.TSTree, snap: Snapshot } = null,
+
+    pub const Output = *c.TSTree;
+    /// The old snapshot, and the new one if the parse gives no tree.
+    pub const max_retire: usize = 2;
+
+    pub fn process(job: *ParseJob, ctx: *text_worker.Context, text: text_worker.Text) ?*c.TSTree {
+        var old_tree: ?*c.TSTree = null;
+        if (job.old) |o| {
+            const edit = inputEdit(o.snap, text.snap);
+            c.ts_tree_edit(o.tree, &edit);
+            old_tree = o.tree;
+        }
+        var snap = text.snap;
+        const input: c.TSInput = .{
+            .payload = &snap,
+            .read = readSnapshot,
+            .encoding = c.TSInputEncodingUTF8,
+            .decode = null,
+        };
+        // The progress callback stops the parse when the worker is
+        // destroyed, so a kill does not wait for a parse nobody needs.
+        const options: c.TSParseOptions = .{ .payload = ctx, .progress_callback = parseProgress };
+        const tree = c.ts_parser_parse_with_options(job.parser, old_tree, input, options);
+
+        if (job.old) |o| {
+            c.ts_tree_delete(o.tree);
+            ctx.retire(o.snap);
+            job.old = null;
+        }
+        const t = tree orelse {
+            // After a stopped parse, the next parse must start again.
+            c.ts_parser_reset(job.parser);
+            ctx.retire(text.snap);
+            return null;
+        };
+        // The main thread gets `t`. The job keeps a copy for the next parse.
+        job.old = .{ .tree = c.ts_tree_copy(t).?, .snap = text.snap };
+        return t;
+    }
+
+    pub fn discard(_: *ParseJob, tree: *c.TSTree) void {
+        c.ts_tree_delete(tree);
+    }
+
+    pub fn finish(job: *ParseJob, ctx: *text_worker.Context) void {
+        if (job.old) |o| {
+            c.ts_tree_delete(o.tree);
+            ctx.retire(o.snap);
+        }
+        c.ts_parser_delete(job.parser);
+    }
+};
+
+const ParseWorker = text_worker.Worker(ParseJob);
+
+/// The `TSParseOptions.progress_callback`: true stops the parse.
+fn parseProgress(state: [*c]c.TSParseState) callconv(.c) bool {
+    const ctx: *const text_worker.Context = @ptrCast(@alignCast(state.*.payload.?));
+    return ctx.cancelled();
+}
+
+/// The `TSInput.read` function: the bytes of the snapshot from `byte_index`
+/// to the end of that chunk.
+fn readSnapshot(payload: ?*anyopaque, byte_index: u32, _: c.TSPoint, bytes_read: [*c]u32) callconv(.c) [*c]const u8 {
+    const snap: *const Snapshot = @ptrCast(@alignCast(payload.?));
+    if (byte_index >= snap.len()) {
+        bytes_read.* = 0;
+        return "";
+    }
+    const chunk = snap.chunkAt(byte_index);
+    bytes_read.* = @intCast(chunk.len);
+    return chunk.ptr;
+}
+
+/// The edit that changes the text of `old` into the text of `new`. If many
+/// edits occurred between two parses, this edit covers all of them. It is
+/// correct, but the parser reuses less.
+fn inputEdit(old: Snapshot, new: Snapshot) c.TSInputEdit {
+    const d = Snapshot.diff(old, new);
+    return .{
+        .start_byte = @intCast(d.start),
+        .old_end_byte = @intCast(d.old_end),
+        .new_end_byte = @intCast(d.new_end),
+        .start_point = tsPoint(old.pointAt(d.start)),
+        .old_end_point = tsPoint(old.pointAt(d.old_end)),
+        .new_end_point = tsPoint(new.pointAt(d.new_end)),
+    };
+}
+
+fn tsPoint(p: rope_zig.Point) c.TSPoint {
+    return .{ .row = @intCast(p.row), .column = @intCast(p.column) };
+}
+
+/// The syntax tree of one buffer. A background thread parses snapshots of
+/// the buffer, so a large file does not stop the editor while the user types.
 pub const Syntax = struct {
     gpa: std.mem.Allocator,
-    parser: *c.TSParser,
     lang: *const Loaded,
+    worker: *ParseWorker,
+    /// The newest tree that the main thread took. `update` edits it with
+    /// `ts_tree_edit`, so its byte offsets match `snap`, also before the
+    /// parse thread gives a new tree.
     tree: ?*c.TSTree = null,
-    /// A copy of the text of the last parse. Predicates need the node text.
-    text: []u8 = &.{},
-    /// The buffer version of the last parse.
+    /// The text that `tree` matches. Predicates read the node text from it.
+    snap: ?Snapshot = null,
+    /// The buffer version that the parse thread parsed for `tree`.
     version: u64 = 0,
+    /// The buffer version of `snap`. It is newer than `version` if the
+    /// buffer changed after that parse.
+    snap_version: u64 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, lang: *const Loaded) !Syntax {
+    /// `rope` is the rope of the buffer. It must stay at its address until
+    /// `deinit`.
+    /// The executor runs the parses of all buffers.
+    pub fn init(executor: *text_worker.Executor, lang: *const Loaded, rope: *Rope) !Syntax {
         const parser = c.ts_parser_new() orelse return error.OutOfMemory;
         errdefer c.ts_parser_delete(parser);
         if (!c.ts_parser_set_language(parser, lang.language)) return error.IncompatibleLanguage;
-        return .{ .gpa = gpa, .parser = parser, .lang = lang };
+        // The job owns the parser from here.
+        const worker = try ParseWorker.create(executor, rope, .{ .parser = parser });
+        return .{ .gpa = executor.gpa, .lang = lang, .worker = worker };
     }
 
     pub fn deinit(self: *Syntax) void {
+        if (self.snap) |s| self.worker.release(s);
         if (self.tree) |t| c.ts_tree_delete(t);
-        self.gpa.free(self.text);
-        c.ts_parser_delete(self.parser);
+        self.worker.destroy();
         self.* = undefined;
     }
 
-    /// Parses the buffer again if it changed since the last parse. This is a
-    /// full parse, not an incremental parse.
+    /// Sends the text to the parse thread if the buffer changed since the
+    /// last request, and takes the newest finished tree. It does not wait.
+    /// If the tree is from an older version, it edits the tree to match the
+    /// current text. The offsets are then correct, but nodes in the edited
+    /// range can be out of date until the next parse.
     pub fn update(self: *Syntax, buf: *const Buffer) !void {
-        if (self.tree != null and self.version == buf.version) return;
+        try self.submit(buf);
+        if (self.worker.take()) |r| self.install(r);
+        self.alignTree(buf);
+    }
+
+    /// As `update`, but waits until the parse thread parsed the current
+    /// text. Structural movement needs a tree that is a real parse.
+    pub fn updateWait(self: *Syntax, buf: *const Buffer) !void {
+        try self.submit(buf);
+        if (self.tree == null or self.version != buf.version) {
+            if (self.worker.wait(buf.version)) |r| self.install(r);
+        }
+        self.alignTree(buf);
+        if (self.tree == null or self.version != buf.version) return error.ParseFailed;
+    }
+
+    /// Edits `tree` from the text of `snap` to the current text. The diff
+    /// of two snapshots that share most leaves is fast, so this is cheap
+    /// enough for each key.
+    fn alignTree(self: *Syntax, buf: *const Buffer) void {
+        const tree = self.tree orelse return;
+        const old = self.snap.?;
+        if (self.snap_version == buf.version) return;
+        const new = self.worker.snapshot();
+        const edit = inputEdit(old, new);
+        c.ts_tree_edit(tree, &edit);
+        self.worker.release(old);
+        self.snap = new;
+        self.snap_version = buf.version;
+    }
+
+    fn submit(self: *Syntax, buf: *const Buffer) !void {
+        std.debug.assert(&buf.rope == self.worker.rope);
         if (buf.len() > std.math.maxInt(u32)) return error.FileTooBig;
-        const text = try buf.copyRange(self.gpa, 0, buf.len());
-        errdefer self.gpa.free(text);
-        const tree = c.ts_parser_parse_string(self.parser, null, text.ptr, @intCast(text.len)) orelse return error.ParseFailed;
+        try self.worker.submit(buf.version);
+    }
+
+    fn install(self: *Syntax, r: ParseWorker.Result) void {
         if (self.tree) |t| c.ts_tree_delete(t);
-        self.gpa.free(self.text);
-        self.tree = tree;
-        self.text = text;
-        self.version = buf.version;
+        if (self.snap) |s| self.worker.release(s);
+        self.tree = r.output;
+        self.snap = r.text.snap;
+        self.version = r.text.version;
+        self.snap_version = r.text.version;
+    }
+
+    /// The smallest node at `pos`, or null without a tree. Call `update`
+    /// first, so that the tree matches the current text.
+    pub fn nodeAt(self: *const Syntax, pos: usize) ?c.TSNode {
+        const r = self.root() orelse return null;
+        const p: u32 = @intCast(pos);
+        const n = c.ts_node_descendant_for_byte_range(r, p, p);
+        return if (c.ts_node_is_null(n)) null else n;
+    }
+
+    /// Where the indentation of a line comes from: the line where the
+    /// innermost enclosing node starts (the "anchor line").
+    pub const IndentAnchor = struct {
+        /// The start of the anchor line, or null at the top level.
+        line: ?usize,
+        /// True: one level more than the anchor line. False: the same, for a
+        /// line that closes the node (it starts with the last token of the
+        /// node, for example "}", ")", "end" or "</div>") or starts a branch
+        /// of it (for example "else").
+        deeper: bool,
+    };
+
+    /// The indent anchor of a line from the syntax tree. `first` is the first
+    /// byte of the line that is not a space or a tab, or the line end if the
+    /// line is blank. Call `update` first.
+    ///
+    /// The caller adds one level to the real indentation of the anchor
+    /// line, so the result follows the style that the file uses. Thus
+    /// "} else {" gets the indentation of its "if", and the lines in the
+    /// else block get one level more.
+    ///
+    /// Null without a tree, if the line starts inside a multi-line string
+    /// or comment, or if an enclosing node has a syntax error. While you
+    /// type, the code is often incomplete (a block without its end), and
+    /// such a tree is not correct. Then the caller uses its own rules.
+    pub fn indentAnchor(self: *const Syntax, first: usize, blank: bool) ?IndentAnchor {
+        const r = self.root() orelse return null;
+        const snap = self.snap orelse return null;
+        const p: u32 = @intCast(first);
+        const row = snap.pointAt(first).row;
+        const leaf = c.ts_node_descendant_for_byte_range(r, p, p);
+        var node = leaf;
+        while (!c.ts_node_is_null(node)) : (node = c.ts_node_parent(node)) {
+            if (c.ts_node_is_null(c.ts_node_parent(node))) break; // the root
+            const start = c.ts_node_start_point(node);
+            if (start.row >= row) continue;
+            const kind = std.mem.span(c.ts_node_type(node));
+            if (std.mem.indexOf(u8, kind, "string") != null or std.mem.indexOf(u8, kind, "comment") != null) return null;
+            if (c.ts_node_has_error(node)) return null;
+            const same = !blank and (closesAt(node, p) or startsBranch(leaf, p));
+            return .{ .line = c.ts_node_start_byte(node) - start.column, .deeper = !same };
+        }
+        // Only the root encloses the line. An error in the root makes the
+        // top level uncertain too.
+        if (c.ts_node_has_error(r)) return null;
+        return .{ .line = null, .deeper = false };
+    }
+
+    /// Keywords that start a branch of the node that encloses them. A line
+    /// that starts with one gets the indentation of the anchor line.
+    const branch_keywords = [_][]const u8{ "else", "elif", "elseif", "except", "finally", "catch" };
+
+    /// True if the token at `p` is a branch keyword, for example "else".
+    fn startsBranch(leaf: c.TSNode, p: u32) bool {
+        if (c.ts_node_is_null(leaf) or c.ts_node_is_named(leaf) or c.ts_node_start_byte(leaf) != p) return false;
+        const kind = std.mem.span(c.ts_node_type(leaf));
+        for (branch_keywords) |k| if (std.mem.eql(u8, kind, k)) return true;
+        return false;
+    }
+
+    /// True if the line at `p` closes `node`: the last child of
+    /// `node` starts at `p`, and it is one of these:
+    ///   - a closing token, for example "}", ")" or "end",
+    ///   - an end tag, for example "</p>" (a node type with "end_tag" or
+    ///     "closing" in it),
+    ///   - a block that starts with "{" on its own line (Allman style).
+    /// Other last children, for example the last statement of a case, do
+    /// not close the node.
+    fn closesAt(node: c.TSNode, p: u32) bool {
+        const count = c.ts_node_child_count(node);
+        if (count == 0) return false;
+        const last = c.ts_node_child(node, count - 1);
+        if (c.ts_node_start_byte(last) != p or c.ts_node_is_missing(last)) return false;
+        if (!c.ts_node_is_named(last)) return true;
+        const kind = std.mem.span(c.ts_node_type(last));
+        if (std.mem.indexOf(u8, kind, "end_tag") != null or std.mem.indexOf(u8, kind, "closing") != null) return true;
+        if (c.ts_node_child_count(last) == 0) return false;
+        const first_token = c.ts_node_child(last, 0);
+        return !c.ts_node_is_named(first_token) and std.mem.eql(u8, std.mem.span(c.ts_node_type(first_token)), "{");
     }
 
     fn root(self: *const Syntax) ?c.TSNode {
@@ -554,9 +813,13 @@ pub const Syntax = struct {
         var spans: std.ArrayList(Span) = .empty;
         defer spans.deinit(self.gpa);
 
+        const snap = self.snap orelse return;
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.gpa);
+
         var match: c.TSQueryMatch = undefined;
         while (c.ts_query_cursor_next_match(cursor, &match)) {
-            if (!hl.passes(&match, self.text)) continue;
+            if (!try hl.passes(&match, snap, self.gpa, &scratch)) continue;
             for (match.captures[0..match.capture_count]) |cap| {
                 const face = hl.faces[cap.index];
                 if (face == .none) continue;
@@ -735,4 +998,45 @@ test "a missing parser library is a load error with a cause" {
     try testing.expectError(error.FileNotFound, langs.load(testing.io, cfg));
     try testing.expect(std.mem.indexOf(u8, langs.lastError(), "/does/not/exist.so") != null);
     try testing.expectError(error.LoadFailed, langs.load(testing.io, cfg)); // fails at once
+}
+
+fn diffEdit(old: []const u8, new: []const u8) !c.TSInputEdit {
+    var a = try Rope.fromSlice(testing.allocator, old);
+    defer a.deinit();
+    var b = try Rope.fromSlice(testing.allocator, new);
+    defer b.deinit();
+    const sa = a.snapshot();
+    defer a.release(sa);
+    const sb = b.snapshot();
+    defer b.release(sb);
+    return inputEdit(sa, sb);
+}
+
+fn expectEdit(old: []const u8, new: []const u8, start: u32, old_end: u32, new_end: u32) !void {
+    const e = try diffEdit(old, new);
+    try testing.expectEqual(start, e.start_byte);
+    try testing.expectEqual(old_end, e.old_end_byte);
+    try testing.expectEqual(new_end, e.new_end_byte);
+}
+
+test "inputEdit finds the changed range" {
+    try expectEdit("abc", "abc", 3, 3, 3); // no change
+    try expectEdit("abc", "abXc", 2, 2, 3); // insert
+    try expectEdit("abXc", "abc", 2, 3, 2); // delete
+    try expectEdit("abc", "aYc", 1, 2, 2); // replace
+    try expectEdit("", "abc", 0, 0, 3);
+    try expectEdit("abc", "", 0, 3, 0);
+    // A repeated character: the prefix and the suffix must not overlap.
+    try expectEdit("aa", "aaa", 2, 2, 3);
+    try expectEdit("aaa", "aa", 2, 3, 2);
+}
+
+test "inputEdit gives rows and byte columns" {
+    const e = try diffEdit("ab\ncd\nef", "ab\ncX\nY\nd\nef");
+    try testing.expectEqual(c.TSPoint{ .row = 1, .column = 1 }, e.start_point);
+    try testing.expectEqual(c.TSPoint{ .row = 1, .column = 1 }, e.old_end_point);
+    try testing.expectEqual(c.TSPoint{ .row = 3, .column = 0 }, e.new_end_point);
+    // A change on the first row adds to the start column.
+    const f = try diffEdit("abc", "abXYc");
+    try testing.expectEqual(c.TSPoint{ .row = 0, .column = 4 }, f.new_end_point);
 }

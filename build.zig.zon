@@ -41,8 +41,8 @@
             .hash = "N-V-__8AAPqeFQDipy0CdI6MKBmwYYarybBTO3IIJPrSzH_w",
         },
         .rope_zig = .{
-            .url = "git+https://github.com/zachary822/rope-zig#13305ad9b0695a8a37008b81b27af715c880a8e6",
-            .hash = "rope_zig-0.0.0-dueVsjGYAAAjCfxH8bLzxgoc8f4mJ8ojcvjZ7N1k3GwU",
+            .url = "git+https://github.com/zachary822/rope-zig#f2eeabbce84aca639ccaf3fbf6b8ea4690e2b473",
+            .hash = "rope_zig-0.0.0-dueVsoHNAAB1guVCOoYPNyuxOkrnHC4KCjnahtsF_5nm",
         },
         .tree_sitter = .{
             .url = "https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.27.2.tar.gz",

@@ -4,6 +4,10 @@ const Translator = @import("translate_c").Translator;
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // `zig build test -Dtsan` finds data races between the main thread and
+    // the text workers. It instruments the Zig code and the rope. Tree-sitter
+    // and Lua are C libraries without instrumentation.
+    const tsan = b.option(bool, "tsan", "Check for data races") orelse false;
 
     const translate_c = b.dependency("translate_c", .{});
     const t: Translator = .init(translate_c, .{
@@ -56,7 +60,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const rope_dep = b.dependency("rope_zig", .{ .target = target, .optimize = optimize });
+    const rope_dep = b.dependency("rope_zig", .{ .target = target, .optimize = optimize, .tsan = tsan });
 
     const exe = b.addExecutable(.{
         .name = "editor_zig",
@@ -64,6 +68,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = tsan,
             .imports = &.{
                 .{ .name = "editor_zig", .module = mod },
                 .{ .name = "c", .module = t.mod },

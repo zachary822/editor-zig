@@ -6,25 +6,53 @@
 //!     editor.run(command_name)              -- runs a builtin command
 //!     editor.face(name, style)              -- defines or changes a face
 //!     editor.set_mode_line(fn | nil)        -- fn(info) returns the mode line text
+//!     editor.on("buffer_open", fn)          -- fn(buf) for each new buffer
+//!     editor.options.<name> = value         -- a global option (see below)
 //!
 //!     editor.buffer.create{ name = , read_only = }   -- or create(name)
+//!     editor.buffer.open(path)  -- the buffer of a file; it does not show it
 //!     editor.buffer.get(name)  editor.buffer.current()  editor.buffer.list()
 //!     buf:name() buf:text() buf:set_text(s) buf:append(s)
 //!     buf:highlight(start, end, face) buf:clear_highlights()
 //!     buf:bind(keys, command) buf:set_read_only(bool)
 //!     buf:cursor() buf:set_cursor(pos) buf:kill() buf:valid()
+//!     buf:len() buf:modified() buf:read_only()
+//!     buf:insert(text)          -- at the cursor, the cursor goes after it
+//!     buf:sub(start, end)       -- the text of a range, clamped to the text
+//!     buf:delete(start, end)
+//!     buf:undo_group(fn)        -- the edits in fn are one undo step
+//!     buf:region()              -- start, end of the active region, or nil
+//!     buf:path()                -- the file of the buffer, or nil
+//!     buf:line_range(pos)       -- start, end of the line at pos (end is
+//!                                  before the newline)
+//!     buf:indent_for(pos, wait) -- the indentation text for the line at pos
+//!                                  from the syntax tree, or nil
+//!     buf:nodes_at(pos, wait)   -- syntax nodes at pos, the smallest first:
+//!                                  { type = , from = , to = } each, or nil
+//!     buf:option(name)          -- the option value that the buffer uses
+//!     buf:set_option(name, v)   -- a buffer option; nil uses the global value
 //!
 //!     editor.window.split{ buffer = , side = "below" | "right", focus = false }
 //!     editor.window.float{ buffer = , row = , col = , width = , height = ,
 //!                          border = true, focus = true }
 //!     editor.window.current()
+//!     editor.window.display(buf) -- makes buf visible in a split window that
+//!                                  is not the selected one (or the window
+//!                                  that shows it already), returns it
 //!     win:close() win:buffer() win:set_buffer(buf) win:focus() win:valid()
 //!     win:on_draw(fn | nil)  -- fn(canvas, width, height), after the text
 //!     canvas:text(row, col, text, face)
 //!
+//! Options:
+//!
+//!     indent_width = 4      -- spaces in one indent level (1 to 16), for TAB
+//!     indent_tabs = false   -- true: TAB inserts a tab character
+//!     tab_width = 8         -- display width of a tab character (1 to 16)
+//!
 //! Positions are byte offsets from 0, and a range includes its start and not
 //! its end. Buffer and window handles hold only an ID. After a buffer is
-//! killed or a window is closed, a call on its handle is a Lua error.
+//! killed or a window is closed, a call on its handle is a Lua error. Two
+//! handles of the same buffer or window are equal with `==`.
 
 const std = @import("std");
 const c = @import("c");
@@ -35,6 +63,7 @@ const Window = main.Window;
 const face = @import("face.zig");
 const files = @import("files.zig");
 const ts = @import("syntax.zig");
+const options = @import("options.zig");
 const layout = @import("layout.zig");
 
 pub const Context = struct {
@@ -55,37 +84,54 @@ const Fn = struct { [:0]const u8, c.lua_CFunction };
 /// Makes the global `editor` table.
 pub fn register(L: *c.lua_State, ctx: *Context) void {
     defineClass(L, ctx, buffer_mt, &.{
-        .{ "name", bufName },             .{ "text", bufText },
-        .{ "set_text", bufSetText },      .{ "append", bufAppend },
-        .{ "highlight", bufHighlight },   .{ "clear_highlights", bufClearHighlights },
-        .{ "bind", bufBind },             .{ "set_read_only", bufSetReadOnly },
-        .{ "cursor", bufCursor },         .{ "set_cursor", bufSetCursor },
-        .{ "kill", bufKill },             .{ "valid", bufValid },
+        .{ "name", bufName },            .{ "text", bufText },
+        .{ "set_text", bufSetText },     .{ "append", bufAppend },
+        .{ "highlight", bufHighlight },  .{ "clear_highlights", bufClearHighlights },
+        .{ "bind", bufBind },            .{ "set_read_only", bufSetReadOnly },
+        .{ "cursor", bufCursor },        .{ "set_cursor", bufSetCursor },
+        .{ "kill", bufKill },            .{ "valid", bufValid },
+        .{ "len", bufLen },              .{ "modified", bufModified },
+        .{ "read_only", bufReadOnly },   .{ "insert", bufInsert },
+        .{ "sub", bufSub },              .{ "delete", bufDelete },
+        .{ "undo_group", bufUndoGroup }, .{ "region", bufRegion },
+        .{ "path", bufPath },            .{ "nodes_at", bufNodesAt },
+        .{ "line_range", bufLineRange }, .{ "option", bufOption },
+        .{ "set_option", bufSetOption }, .{ "indent_for", bufIndentFor },
     });
     defineClass(L, ctx, window_mt, &.{
-        .{ "close", winClose },           .{ "buffer", winBuffer },
-        .{ "set_buffer", winSetBuffer },  .{ "focus", winFocus },
-        .{ "valid", winValid },           .{ "on_draw", winOnDraw },
+        .{ "close", winClose },          .{ "buffer", winBuffer },
+        .{ "set_buffer", winSetBuffer }, .{ "focus", winFocus },
+        .{ "valid", winValid },          .{ "on_draw", winOnDraw },
     });
     defineClass(L, ctx, canvas_mt, &.{.{ "text", canvasText }});
 
     c.lua_createtable(L, 0, 8);
     setFunctions(L, ctx, &.{
-        .{ "bind", luaBind },             .{ "language", luaLanguage },
-        .{ "message", luaMessage },       .{ "run", luaRun },
-        .{ "face", luaFace },             .{ "set_mode_line", luaSetModeLine },
+        .{ "bind", luaBind },       .{ "language", luaLanguage },
+        .{ "message", luaMessage }, .{ "run", luaRun },
+        .{ "face", luaFace },       .{ "set_mode_line", luaSetModeLine },
+        .{ "on", luaOn },
     });
     c.lua_createtable(L, 0, 4);
     setFunctions(L, ctx, &.{
         .{ "create", bufferCreate }, .{ "get", bufferGet },
-        .{ "current", bufferCurrent }, .{ "list", bufferList },
+        .{ "open", bufferOpen },     .{ "current", bufferCurrent },
+        .{ "list", bufferList },
     });
     c.lua_setfield(L, -2, "buffer");
     c.lua_createtable(L, 0, 3);
     setFunctions(L, ctx, &.{
-        .{ "split", windowSplit }, .{ "float", windowFloat }, .{ "current", windowCurrent },
+        .{ "split", windowSplit },     .{ "float", windowFloat }, .{ "current", windowCurrent },
+        .{ "display", windowDisplay },
     });
     c.lua_setfield(L, -2, "window");
+    // `editor.options`: an empty table whose metatable reads and writes the
+    // global options, so each write is checked.
+    c.lua_createtable(L, 0, 0);
+    c.lua_createtable(L, 0, 2);
+    setFunctions(L, ctx, &.{ .{ "__index", optionsIndex }, .{ "__newindex", optionsNewIndex } });
+    _ = c.lua_setmetatable(L, -2);
+    c.lua_setfield(L, -2, "options");
     c.lua_setglobal(L, "editor");
 }
 
@@ -105,7 +151,25 @@ fn defineClass(L: *c.lua_State, ctx: *Context, name: [:0]const u8, methods: []co
     c.lua_createtable(L, 0, @intCast(methods.len));
     setFunctions(L, ctx, methods);
     c.lua_setfield(L, -2, "__index");
+    c.lua_pushcclosure(L, handleEq, 0);
+    c.lua_setfield(L, -2, "__eq");
     c.lua_settop(L, -2);
+}
+
+/// `__eq` for handles: two handles are equal if they have the same
+/// metatable and the same ID.
+fn handleEq(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    var equal = false;
+    if (c.lua_getmetatable(L, 1) != 0 and c.lua_getmetatable(L, 2) != 0) {
+        if (c.lua_rawequal(L, -1, -2) != 0) {
+            const a: *const u32 = @ptrCast(@alignCast(c.lua_touserdata(L, 1)));
+            const b: *const u32 = @ptrCast(@alignCast(c.lua_touserdata(L, 2)));
+            equal = a.* == b.*;
+        }
+    }
+    c.lua_pushboolean(L, @intFromBool(equal));
+    return 1;
 }
 
 fn ctxOf(L: *c.lua_State) *Context {
@@ -271,6 +335,105 @@ fn luaSetModeLine(state: ?*c.lua_State) callconv(.c) c_int {
     return 0;
 }
 
+/// Lua: `editor.on(event, fn)`. Adds a hook. The only event now is
+/// "buffer_open": `fn(buf)` runs for each new buffer, after a file buffer
+/// gets its syntax tree. Buffers that exist already do not get the call;
+/// use `editor.buffer.list()` for them.
+fn luaOn(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const ed = ctxOf(L).editor;
+    const event = checkString(L, 1);
+    c.luaL_checktype(L, 2, c.LUA_TFUNCTION);
+    if (!std.mem.eql(u8, event, "buffer_open")) raise(L, "editor.on: unknown event: %s", .{c.lua_tolstring(L, 1, null)});
+    ed.buffer_open_hooks.ensureUnusedCapacity(ed.gpa, 1) catch |err| raiseErr(L, "editor.on", err);
+    c.lua_pushvalue(L, 2);
+    ed.buffer_open_hooks.appendAssumeCapacity(c.luaL_ref(L, c.LUA_REGISTRYINDEX));
+    return 0;
+}
+
+// Options
+
+fn checkOptionName(L: *c.lua_State, idx: c_int) options.Name {
+    return std.meta.stringToEnum(options.Name, checkString(L, idx)) orelse
+        raise(L, "unknown option: %s", .{c.lua_tolstring(L, idx, null)});
+}
+
+fn pushOption(L: *c.lua_State, o: options.Options, name: options.Name) void {
+    switch (name) {
+        inline else => |n| {
+            const v = @field(o, @tagName(n));
+            switch (@TypeOf(v)) {
+                bool => c.lua_pushboolean(L, @intFromBool(v)),
+                u8 => c.lua_pushinteger(L, v),
+                else => @compileError("no Lua type for this option"),
+            }
+        },
+    }
+}
+
+/// Reads an option value at `idx` and checks it.
+fn checkOptionValue(L: *c.lua_State, comptime T: type, comptime name: []const u8, idx: c_int) T {
+    switch (T) {
+        bool => {
+            if (c.lua_type(L, idx) != c.LUA_TBOOLEAN) raise(L, "%s must be true or false", .{name.ptr});
+            return c.lua_toboolean(L, idx) != 0;
+        },
+        u8 => {
+            if (c.lua_isinteger(L, idx) == 0) raise(L, "%s must be an integer", .{name.ptr});
+            const n = c.lua_tointegerx(L, idx, null);
+            if (n < 1 or n > options.max_width) raise(L, "%s must be from 1 to %d", .{ name.ptr, @as(c_int, options.max_width) });
+            return @intCast(n);
+        },
+        else => @compileError("no Lua type for this option"),
+    }
+}
+
+/// `editor.options.<name>`: the global value.
+fn optionsIndex(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    pushOption(L, ctxOf(L).editor.options, checkOptionName(L, 2));
+    return 1;
+}
+
+/// `editor.options.<name> = value`: sets the global value.
+fn optionsNewIndex(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const o = &ctxOf(L).editor.options;
+    switch (checkOptionName(L, 2)) {
+        inline else => |n| {
+            const field = @tagName(n);
+            @field(o, field) = checkOptionValue(L, @FieldType(options.Options, field), field, 3);
+        },
+    }
+    return 0;
+}
+
+/// Lua: `buf:option(name)`. The value that the buffer uses: its own value,
+/// or the global value.
+fn bufOption(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    pushOption(L, ctxOf(L).editor.optionsFor(e), checkOptionName(L, 2));
+    return 1;
+}
+
+/// Lua: `buf:set_option(name, value)`. A value for this buffer only. `nil`
+/// removes it, so the buffer uses the global value again.
+fn bufSetOption(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    switch (checkOptionName(L, 2)) {
+        inline else => |n| {
+            const field = @tagName(n);
+            @field(e.options, field) = if (c.lua_type(L, 3) <= c.LUA_TNIL)
+                null
+            else
+                checkOptionValue(L, @FieldType(options.Options, field), field, 3);
+        },
+    }
+    return 0;
+}
+
 // editor.buffer
 
 /// Lua: `editor.buffer.create(name)` or `editor.buffer.create{ name = ,
@@ -290,7 +453,10 @@ fn bufferCreate(state: ?*c.lua_State) callconv(.c) c_int {
     };
     const e = ed.createBuffer(name_ptr[0..name_len]) catch |err| raiseErr(L, "editor.buffer.create", err);
     e.buf.read_only = read_only;
-    pushHandle(L, buffer_mt, e.id);
+    const id = e.id;
+    // Last: a hook can kill the buffer, so `e` is not used after it.
+    ed.bufferOpened(id);
+    pushHandle(L, buffer_mt, id);
     return 1;
 }
 
@@ -303,6 +469,33 @@ fn bufferGet(state: ?*c.lua_State) callconv(.c) c_int {
     };
     pushHandle(L, buffer_mt, e.id);
     return 1;
+}
+
+/// Lua: `editor.buffer.open(path)`. The buffer that visits the file `path`,
+/// as C-x C-f finds it, but it does not show the buffer. If a buffer visits
+/// the file, it returns that buffer. Otherwise it reads the file into a new
+/// buffer with its language and calls the `buffer_open` hooks. A file that
+/// does not exist gives an empty buffer; the first save makes the file.
+/// "~" means the home directory. An error if the file cannot be read.
+fn bufferOpen(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const ctx = ctxOf(L);
+    const ed = ctx.editor;
+    const id = openPath(ed, checkString(L, 1), ctx.home) catch |err| raiseErr(L, "editor.buffer.open", err);
+    pushHandle(L, buffer_mt, id);
+    return 1;
+}
+
+/// Opens a file for `bufferOpen`, and returns the buffer ID. A separate
+/// function, because a Lua error skips Zig defers.
+fn openPath(ed: *Editor, path: []const u8, home: ?[]const u8) !u32 {
+    const full = try files.expandPath(ed.gpa, path, home);
+    defer ed.gpa.free(full);
+    const opened = try ed.openFileBuffer(full);
+    const id = opened.entry.id;
+    // Last: a hook can kill the buffer, so the entry is not used after it.
+    if (opened.new) ed.bufferOpened(id);
+    return id;
 }
 
 /// Lua: `editor.buffer.current()`. The buffer of the selected window.
@@ -336,11 +529,18 @@ fn bufName(state: ?*c.lua_State) callconv(.c) c_int {
 fn bufText(state: ?*c.lua_State) callconv(.c) c_int {
     const L = state.?;
     const e = checkBuffer(L, 1);
-    const ed = ctxOf(L).editor;
-    const text = e.buf.copyRange(ed.gpa, 0, e.buf.len()) catch |err| raiseErr(L, "buf:text", err);
-    _ = c.lua_pushlstring(L, text.ptr, text.len);
-    ed.gpa.free(text);
+    pushRange(L, &e.buf, 0, e.buf.len());
     return 1;
+}
+
+/// Pushes the bytes from `start` to `end` as a Lua string. It copies into
+/// Lua memory directly: a Lua memory error is a longjmp, and it would leak
+/// a Zig allocation.
+fn pushRange(L: *c.lua_State, buf: *const @import("buffer.zig").Buffer, start: usize, end: usize) void {
+    var b: c.luaL_Buffer = undefined;
+    const out = c.luaL_buffinitsize(L, &b, end - start);
+    buf.copyInto(start, out[0 .. end - start]);
+    c.luaL_pushresultsize(&b, end - start);
 }
 
 fn bufSetText(state: ?*c.lua_State) callconv(.c) c_int {
@@ -432,6 +632,206 @@ fn bufValid(state: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+/// Lua: `buf:len()`. The length of the text in bytes.
+fn bufLen(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    c.lua_pushinteger(L, @intCast(checkBuffer(L, 1).buf.len()));
+    return 1;
+}
+
+/// Lua: `buf:modified()`. True if the text is not the same as at the last
+/// save or load.
+fn bufModified(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    c.lua_pushboolean(L, @intFromBool(checkBuffer(L, 1).buf.isModified()));
+    return 1;
+}
+
+/// Lua: `buf:read_only()`.
+fn bufReadOnly(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    c.lua_pushboolean(L, @intFromBool(checkBuffer(L, 1).buf.read_only));
+    return 1;
+}
+
+/// Lua: `buf:insert(text)`. Inserts at the cursor, and puts the cursor
+/// after the text. It is one undo step, or a part of an `undo_group`.
+fn bufInsert(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    e.buf.insert(checkString(L, 2)) catch |err| raiseErr(L, "buf:insert", err);
+    return 0;
+}
+
+/// A position argument, clamped to the text.
+fn clampedPos(L: *c.lua_State, idx: c_int, len: usize) usize {
+    const n = c.luaL_checkinteger(L, idx);
+    if (n < 0) return 0;
+    return @min(@as(usize, @intCast(n)), len);
+}
+
+/// Lua: `buf:sub(start, end)`. The bytes from `start` to `end`. As with
+/// `string.sub`, a range outside the text is clamped, so `buf:sub(p, p + 1)`
+/// at the end of the text gives "".
+fn bufSub(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    const len = e.buf.len();
+    const start = clampedPos(L, 2, len);
+    const end = @max(start, clampedPos(L, 3, len));
+    pushRange(L, &e.buf, start, end);
+    return 1;
+}
+
+/// Lua: `buf:delete(start, end)`. The cursor moves with the text.
+fn bufDelete(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    const start = c.luaL_checkinteger(L, 2);
+    const end = c.luaL_checkinteger(L, 3);
+    if (start < 0 or end < start or end > e.buf.len()) raise(L, "buf:delete: invalid range", .{});
+    e.buf.deleteRange(@intCast(start), @intCast(end)) catch |err| raiseErr(L, "buf:delete", err);
+    return 0;
+}
+
+/// Lua: `buf:undo_group(fn)`. Calls `fn()`. All edits in it are one undo
+/// step. An error in `fn` ends the group, then goes to the caller.
+fn bufUndoGroup(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    c.luaL_checktype(L, 2, c.LUA_TFUNCTION);
+    const id = e.id;
+    e.buf.beginUndoGroup();
+    c.lua_pushvalue(L, 2);
+    const status = c.lua_pcallk(L, 0, 0, 0, 0, null);
+    // The function can kill the buffer, so find it again.
+    if (ctxOf(L).editor.bufferById(id)) |again| again.buf.endUndoGroup();
+    if (status != c.LUA_OK) _ = c.lua_error(L);
+    return 0;
+}
+
+/// Lua: `buf:region()`. The start and end of the active region, or nil.
+/// An edit makes the region inactive, so read it first.
+fn bufRegion(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const r = checkBuffer(L, 1).buf.activeRegion() orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    c.lua_pushinteger(L, @intCast(r.start));
+    c.lua_pushinteger(L, @intCast(r.end));
+    return 2;
+}
+
+/// Lua: `buf:indent_for(pos, wait)`. The indentation text that the line at
+/// `pos` gets from the syntax tree: the indentation of the line where the
+/// innermost enclosing node starts, plus one level (from `indent_width` and
+/// `indent_tabs`), or plus nothing for a line that closes the node or
+/// starts a branch of it ("}", "end", "else"). "" at the top level.
+/// Nil without a syntax tree, if the line starts inside a multi-line string
+/// or comment, or if the code around the line has a syntax error (for
+/// example a block that has no end yet). `wait` is as in `buf:nodes_at`.
+fn bufIndentFor(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    const pos = clampedPos(L, 2, e.buf.len());
+    const syn = updatedSyntax(L, e, 3) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    const first = e.buf.firstNonBlank(e.buf.lineStart(pos));
+    const anchor = syn.indentAnchor(first, first == e.buf.lineEnd(pos)) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    const line = anchor.line orelse {
+        _ = c.lua_pushstring(L, "");
+        return 1;
+    };
+    // The indentation of the anchor line, then one level.
+    const ws_end = e.buf.firstNonBlank(line);
+    const unit: []const u8 = if (anchor.deeper) options.indentUnit(ctxOf(L).editor.optionsFor(e)) else "";
+    // Copy into Lua memory directly, as `pushRange` does.
+    const ws_len = ws_end - line;
+    var b: c.luaL_Buffer = undefined;
+    const out = c.luaL_buffinitsize(L, &b, ws_len + unit.len);
+    e.buf.copyInto(line, out[0..ws_len]);
+    @memcpy(out[ws_len..][0..unit.len], unit);
+    c.luaL_pushresultsize(&b, ws_len + unit.len);
+    return 1;
+}
+
+/// The syntax tree of a buffer, updated for its current text, or null if
+/// the buffer has none or the update fails. The boolean at `wait_idx` is
+/// the `wait` argument: true waits for the parse thread.
+fn updatedSyntax(L: *c.lua_State, e: *BufferEntry, wait_idx: c_int) ?*ts.Syntax {
+    const syn = if (e.syntax) |*s| s else return null;
+    const wait = c.lua_toboolean(L, wait_idx) != 0;
+    (if (wait) syn.updateWait(&e.buf) else syn.update(&e.buf)) catch return null;
+    return syn;
+}
+
+/// Lua: `buf:line_range(pos)`. The start and the end of the line that holds
+/// `pos`. The end is before the newline. `pos` is clamped to the text.
+fn bufLineRange(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    const pos = clampedPos(L, 2, e.buf.len());
+    c.lua_pushinteger(L, @intCast(e.buf.lineStart(pos)));
+    c.lua_pushinteger(L, @intCast(e.buf.lineEnd(pos)));
+    return 2;
+}
+
+/// Lua: `buf:path()`. The file that the buffer visits, or nil.
+fn bufPath(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const path = checkBuffer(L, 1).buf.file_path orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    _ = c.lua_pushlstring(L, path.ptr, path.len);
+    return 1;
+}
+
+/// Lua: `buf:nodes_at(pos)`. The syntax nodes at `pos`, from the smallest
+/// node to the root. Each is `{ type = "string_literal", from = 4, to = 9 }`
+/// with byte offsets. The smallest node can start or end at `pos`, so use
+/// `from < pos and pos < to` to find the nodes that have `pos` inside them.
+/// Nil if the buffer has no syntax tree.
+///
+/// Without `wait`, it does not wait for the parse thread: the offsets match
+/// the text, but the nodes near a new edit can be out of date for a short
+/// time. With `wait = true`, it waits for the parse of the current text.
+/// An incremental parse is usually a few milliseconds.
+fn bufNodesAt(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const e = checkBuffer(L, 1);
+    const pos = clampedPos(L, 2, e.buf.len());
+    const syn = updatedSyntax(L, e, 3) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    var node = syn.nodeAt(pos) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    c.lua_createtable(L, 8, 0);
+    var i: c.lua_Integer = 1;
+    while (true) : (i += 1) {
+        c.lua_createtable(L, 0, 3);
+        _ = c.lua_pushstring(L, c.ts_node_type(node));
+        c.lua_setfield(L, -2, "type");
+        c.lua_pushinteger(L, c.ts_node_start_byte(node));
+        c.lua_setfield(L, -2, "from");
+        c.lua_pushinteger(L, c.ts_node_end_byte(node));
+        c.lua_setfield(L, -2, "to");
+        c.lua_rawseti(L, -2, i);
+        node = c.ts_node_parent(node);
+        if (c.ts_node_is_null(node)) break;
+    }
+    return 1;
+}
+
 // editor.window
 
 /// The `buffer` field of an options table, or the selected window's buffer.
@@ -487,6 +887,27 @@ fn windowFloat(state: ?*c.lua_State) callconv(.c) c_int {
 fn windowCurrent(state: ?*c.lua_State) callconv(.c) c_int {
     const L = state.?;
     pushHandle(L, window_mt, ctxOf(L).editor.selected.id);
+    return 1;
+}
+
+/// Lua: `editor.window.display(buf)`. Makes a buffer visible, as Emacs
+/// `display-buffer`, and returns its window. If a window shows the buffer
+/// already, it returns that window, and that can be the selected window.
+/// Otherwise it shows the buffer in a split window that is not the selected
+/// window: the one that was selected before, another one, or a new split
+/// below the selected window. It does not use floating windows. The
+/// selection does not change.
+fn windowDisplay(state: ?*c.lua_State) callconv(.c) c_int {
+    const L = state.?;
+    const ed = ctxOf(L).editor;
+    const e = checkBuffer(L, 1);
+    for (ed.windows.items) |w| if (w.entry == e) {
+        pushHandle(L, window_mt, w.id);
+        return 1;
+    };
+    const win = ed.windowForDisplay(ed.selected) catch |err| raiseErr(L, "editor.window.display", err);
+    ed.showBuffer(win, e) catch |err| raiseErr(L, "editor.window.display", err);
+    pushHandle(L, window_mt, win.id);
     return 1;
 }
 
@@ -589,6 +1010,15 @@ pub fn callOnDraw(ed: *Editor, win: *Window, ref: c_int, rect: layout.Rect) void
     if (c.lua_pcallk(L, 3, 0, 0, 0, null) != c.LUA_OK) showError(ed, L, "on_draw");
 }
 
+/// Calls a `buffer_open` hook with a buffer handle. An error shows in the
+/// echo area.
+pub fn callBufferHook(ed: *Editor, ref: c_int, id: u32) void {
+    const L = ed.L orelse return;
+    _ = c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, ref);
+    pushHandle(L, buffer_mt, id);
+    if (c.lua_pcallk(L, 1, 0, 0, 0, null) != c.LUA_OK) showError(ed, L, "buffer_open");
+}
+
 /// The mode line text from the Lua function, or null for the default text.
 pub fn modeLineText(ed: *Editor, win: *Window, out: []u8) ?[]const u8 {
     const ref = ed.mode_line_fn orelse return null;
@@ -603,7 +1033,7 @@ pub fn modeLineText(ed: *Editor, win: *Window, out: []u8) ?[]const u8 {
     c.lua_setfield(L, -2, "buffer");
     c.lua_pushinteger(L, @intCast(b.lineOf(point) + 1));
     c.lua_setfield(L, -2, "line");
-    c.lua_pushinteger(L, @intCast(b.displayColumn(point, 8)));
+    c.lua_pushinteger(L, @intCast(b.displayColumn(point, ed.optionsFor(win.entry).tab_width)));
     c.lua_setfield(L, -2, "col");
     c.lua_pushboolean(L, @intFromBool(b.isModified()));
     c.lua_setfield(L, -2, "modified");
@@ -624,7 +1054,7 @@ pub fn modeLineText(ed: *Editor, win: *Window, out: []u8) ?[]const u8 {
 }
 
 /// Shows the error message on the Lua stack in the echo area, and pops it.
-fn showError(ed: *Editor, L: *c.lua_State, what: []const u8) void {
+pub fn showError(ed: *Editor, L: *c.lua_State, what: []const u8) void {
     var len: usize = 0;
     const msg = c.lua_tolstring(L, -1, &len);
     ed.setMessage("Lua error in {s}: {s}", .{ what, if (msg) |m| m[0..len] else "?" });

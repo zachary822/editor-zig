@@ -36,6 +36,11 @@ pub const Buffer = struct {
     /// The kind of the last edit, for undo groups. Movement clears it.
     last_edit: ?EditKind = null,
     group_len: usize = 0,
+    /// The depth of `beginUndoGroup` calls. While it is above 0, all edits
+    /// are one undo step.
+    undo_group_depth: u32 = 0,
+    /// True after the first edit in the current undo group saved the text.
+    undo_group_saved: bool = false,
     /// The other end of the region. Null until the first set-mark. Edits
     /// move it like an Emacs marker.
     mark: ?usize = null,
@@ -298,15 +303,7 @@ pub const Buffer = struct {
     /// deleted.
     pub fn killLine(self: *Buffer, gpa: std.mem.Allocator) !?[]u8 {
         const end = self.lineEnd(self.cursor);
-        var blank = true;
-        var p = self.cursor;
-        while (p < end) : (p += 1) {
-            const b = self.rope.byteAt(p);
-            if (b != ' ' and b != '\t') {
-                blank = false;
-                break;
-            }
-        }
+        const blank = self.firstNonBlank(self.cursor) == end;
         const stop = if (blank and end < self.len()) end + 1 else end;
         if (stop == self.cursor) return null;
 
@@ -353,21 +350,80 @@ pub const Buffer = struct {
     }
 
     /// Returns a copy of the bytes from `start` to `end`, owned by the caller.
+    /// It finds `start` in O(log n) time.
     pub fn copyRange(self: *const Buffer, gpa: std.mem.Allocator, start: usize, end: usize) ![]u8 {
         std.debug.assert(start <= end and end <= self.len());
         const out = try gpa.alloc(u8, end - start);
-        var pos: usize = 0; // buffer position of the current chunk
-        var it = self.rope.chunks();
-        while (it.next()) |chunk| : (pos += chunk.len) {
-            const lo = @max(start, pos);
-            const hi = @min(end, pos + chunk.len);
-            if (lo < hi) @memcpy(out[lo - start .. hi - start], chunk[lo - pos .. hi - pos]);
-            if (pos + chunk.len >= end) break;
-        }
+        self.copyInto(start, out);
         return out;
     }
 
+    /// Copies `out.len` bytes from `start` into `out`. It finds `start` in
+    /// O(log n) time.
+    pub fn copyInto(self: *const Buffer, start: usize, out: []u8) void {
+        std.debug.assert(start + out.len <= self.len());
+        // A view of the current tree, without a reference. It is valid until
+        // the next edit.
+        const view: Snapshot = .{ .root = self.rope.root };
+        view.copyRange(start, out);
+    }
+
+    /// Inserts `text` at `pos` as one undo step. The cursor moves with the
+    /// text if it is after `pos`, as the mark does.
+    pub fn insertAt(self: *Buffer, pos: usize, text: []const u8) !void {
+        std.debug.assert(pos <= self.len());
+        if (text.len == 0) return;
+        try self.recordUndo(.other);
+        try self.editInsert(pos, text);
+        if (self.cursor > pos) self.cursor += text.len;
+        self.goal_col = null;
+    }
+
+    /// Inserts `unit` at the start of each line in the active region, as one
+    /// undo step. Empty lines stay empty. A region that ends at the start of
+    /// a line does not include that line. The region stays active.
+    pub fn indentRegion(self: *Buffer, unit: []const u8) !void {
+        const r = self.activeRegion() orelse return error.NoRegion;
+        var last = self.lineStart(r.end);
+        if (last == r.end and r.end > r.start) last = self.lineStart(r.end - 1);
+        const first = self.lineStart(r.start);
+        self.beginUndoGroup();
+        defer self.endUndoGroup();
+        // From the last line to the first, so that the earlier positions stay
+        // correct.
+        var ls = last;
+        while (true) {
+            if (ls < self.len() and self.rope.byteAt(ls) != '\n') try self.insertAt(ls, unit);
+            if (ls == first) break;
+            ls = self.lineStart(ls - 1);
+        }
+        self.mark_active = true;
+    }
+
+    /// Deletes the bytes from `start` to `end` as one undo step. The cursor
+    /// moves with the text, as the mark does.
+    pub fn deleteRange(self: *Buffer, start: usize, end: usize) !void {
+        std.debug.assert(start <= end and end <= self.len());
+        if (start == end) return;
+        try self.recordUndo(.other);
+        try self.editDelete(start, end - start);
+        self.cursor = afterDelete(self.cursor, start, end - start);
+        self.goal_col = null;
+    }
+
     // Undo and redo
+
+    /// Starts an undo group: all edits until the matching `endUndoGroup`
+    /// are one undo step. Groups can nest.
+    pub fn beginUndoGroup(self: *Buffer) void {
+        self.undo_group_depth += 1;
+    }
+
+    pub fn endUndoGroup(self: *Buffer) void {
+        std.debug.assert(self.undo_group_depth > 0);
+        self.undo_group_depth -= 1;
+        if (self.undo_group_depth == 0) self.undo_group_saved = false;
+    }
 
     /// Puts the text and cursor back to how they were before the last undo
     /// step. Each undo goes one more step back.
@@ -402,6 +458,9 @@ pub const Buffer = struct {
     /// Replaces the current text and cursor with the newest entry of `stack`.
     fn popState(self: *Buffer, stack: *std.ArrayList(UndoEntry)) void {
         const entry = stack.pop().?;
+        // An undo in an undo group can take the group's saved state. Then
+        // the next edit in the group must save a state again.
+        if (self.undo_group_depth > 0) self.undo_group_saved = false;
         self.rope.restore(entry.snap);
         self.version +%= 1;
         self.rope.release(entry.snap);
@@ -428,6 +487,15 @@ pub const Buffer = struct {
         for (self.redo_stack.items) |entry| self.rope.release(entry.snap);
         self.redo_stack.clearRetainingCapacity();
 
+        if (self.undo_group_depth > 0) {
+            if (self.undo_group_saved) return;
+            try self.pushState(&self.undo_stack);
+            self.undo_group_saved = true;
+            // The next typed text starts a new step.
+            self.last_edit = .other;
+            self.group_len = 1;
+            return;
+        }
         if (kind != .other and self.last_edit == kind and self.group_len < max_group) {
             self.group_len += 1;
             return;
@@ -568,13 +636,27 @@ pub const Buffer = struct {
         return col;
     }
 
-    fn lineStart(self: *const Buffer, pos: usize) usize {
+    /// The start of the line that holds `pos`.
+    pub fn lineStart(self: *const Buffer, pos: usize) usize {
         var p = pos;
         while (p > 0 and self.rope.byteAt(p - 1) != '\n') p -= 1;
         return p;
     }
 
-    fn lineEnd(self: *const Buffer, pos: usize) usize {
+    /// The first byte at or after `pos` on its line that is not a space or
+    /// a tab. It is the line end if only spaces and tabs come after `pos`.
+    pub fn firstNonBlank(self: *const Buffer, pos: usize) usize {
+        const end = self.lineEnd(pos);
+        var p = pos;
+        while (p < end) : (p += 1) {
+            const b = self.rope.byteAt(p);
+            if (b != ' ' and b != '\t') break;
+        }
+        return p;
+    }
+
+    /// The end of the line that holds `pos`, before its newline.
+    pub fn lineEnd(self: *const Buffer, pos: usize) usize {
         var p = pos;
         while (p < self.len() and self.rope.byteAt(p) != '\n') p += 1;
         return p;
@@ -1073,4 +1155,69 @@ test "goal column counts codepoints" {
     try testing.expectEqual(7, buf.cursor); // "ab|c"
     buf.previousLine();
     try testing.expectEqual(4, buf.cursor);
+}
+
+test "an undo group is one undo step" {
+    var buf = try Buffer.initText(testing.allocator, "ab");
+    defer buf.deinit();
+    buf.moveTo(1);
+    try buf.insertCodepoint('x'); // a separate step before the group
+    buf.beginUndoGroup();
+    try buf.insert("(");
+    buf.beginUndoGroup(); // nested
+    try buf.insert(")");
+    buf.endUndoGroup();
+    buf.moveTo(3);
+    try buf.deleteRange(0, 1);
+    buf.endUndoGroup();
+    try expectText(&buf, "x()b");
+    try testing.expectEqual(2, buf.cursor); // moved with the deletion
+    try buf.undo();
+    try expectText(&buf, "axb");
+    try buf.undo();
+    try expectText(&buf, "ab");
+}
+
+test "deleteRange moves the cursor with the text" {
+    var buf = try Buffer.initText(testing.allocator, "0123456789");
+    defer buf.deinit();
+    buf.moveTo(8);
+    try buf.deleteRange(2, 5);
+    try testing.expectEqual(5, buf.cursor);
+    buf.moveTo(3);
+    try buf.deleteRange(1, 4);
+    try testing.expectEqual(1, buf.cursor);
+    try expectText(&buf, "0789");
+}
+
+test "indentRegion indents each line of the region" {
+    var buf = try Buffer.initText(testing.allocator, "a\n\nb\nc\nd");
+    defer buf.deinit();
+    buf.moveTo(1); // inside line "a"
+    buf.setMark();
+    buf.moveTo(7); // the start of line "d": not included
+    try buf.indentRegion("  ");
+    try expectText(&buf, "  a\n\n  b\n  c\nd");
+    try testing.expect(buf.activeRegion() != null);
+    try testing.expectEqual(13, buf.cursor); // still at the start of "d"
+    try buf.indentRegion("\t"); // again: the region still covers the lines
+    try expectText(&buf, "\t  a\n\n\t  b\n\t  c\nd");
+    try buf.undo();
+    try expectText(&buf, "  a\n\n  b\n  c\nd");
+
+    buf.deactivateMark();
+    try testing.expectError(error.NoRegion, buf.indentRegion("  "));
+}
+
+test "an undo inside an undo group starts a new step for the next edit" {
+    var buf = try Buffer.initText(testing.allocator, "");
+    defer buf.deinit();
+    buf.beginUndoGroup();
+    try buf.insert("a");
+    try buf.undo(); // takes the group's saved state
+    try buf.insert("b"); // must save a state again
+    buf.endUndoGroup();
+    try expectText(&buf, "b");
+    try buf.undo();
+    try expectText(&buf, "");
 }
