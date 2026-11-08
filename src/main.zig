@@ -1081,14 +1081,32 @@ pub const Editor = struct {
         return .{ .entry = e, .new = true, .missing = text == null };
     }
 
-    /// `path` as an absolute path without "." and ".." parts, from the
-    /// current directory. Two paths for the same file then compare equal,
-    /// except through symbolic links. The caller frees it.
+    /// `path` as an absolute path without "." and ".." parts and without
+    /// symbolic links, from the current directory. Two paths for the same
+    /// file then compare equal. For a file that does not exist yet, only
+    /// its directory is resolved. The caller frees it.
     pub fn absolutePath(self: *Editor, path: []const u8) ![]u8 {
-        if (std.fs.path.isAbsolute(path)) return std.fs.path.resolveAlloc(self.gpa, &.{path});
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = try Io.Dir.cwd().realPath(self.io, &cwd_buf);
-        return std.fs.path.resolveAlloc(self.gpa, &.{ cwd_buf[0..n], path });
+        // First an absolute path without "." and ".." parts.
+        const plain = if (std.fs.path.isAbsolute(path))
+            try std.fs.path.resolveAlloc(self.gpa, &.{path})
+        else blk: {
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const n = try Io.Dir.cwd().realPath(self.io, &cwd_buf);
+            break :blk try std.fs.path.resolveAlloc(self.gpa, &.{ cwd_buf[0..n], path });
+        };
+        defer self.gpa.free(plain);
+        // Then resolve symbolic links, as the current directory is resolved:
+        // the full path if the file exists, or else its directory.
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (Io.Dir.realPathFileAbsolute(self.io, plain, &buf)) |n| {
+            return self.gpa.dupe(u8, buf[0..n]);
+        } else |_| {}
+        if (std.fs.path.dirname(plain)) |dir| {
+            if (Io.Dir.realPathFileAbsolute(self.io, dir, &buf)) |n| {
+                return std.fs.path.resolveAlloc(self.gpa, &.{ buf[0..n], std.fs.path.basename(plain) });
+            } else |_| {}
+        }
+        return self.gpa.dupe(u8, plain);
     }
 
     /// Shows the file `path` in the selected window. If a buffer visits the
@@ -1099,7 +1117,11 @@ pub const Editor = struct {
             error.OutOfMemory => return err,
             else => return self.setMessage("Cannot open {s}: {t}", .{ path, err }),
         };
-        try self.showBuffer(self.selected, opened.entry);
+        self.showBuffer(self.selected, opened.entry) catch |err| {
+            // The buffer exists now, so it must get its hooks anyway.
+            if (opened.new) self.bufferOpened(opened.entry.id);
+            return err;
+        };
         if (!opened.new) return;
         self.last_command = null;
         if (opened.missing) self.setMessage("(New file)", .{});
@@ -3165,6 +3187,8 @@ test "lua: buffer.open, window.display, buffer info and equal handles" {
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
     try t.lua("opened = 0; editor.on('buffer_open', function() opened = opened + 1 end)");
+    // "link" is a symbolic link to the directory itself.
+    try tmp.dir.symLink(testing.io, ".", "link", .{ .is_directory = true });
 
     var code_buf: [std.fs.max_path_bytes + 2048]u8 = undefined;
     const code = try std.fmt.bufPrintSentinel(&code_buf,
@@ -3202,6 +3226,9 @@ test "lua: buffer.open, window.display, buffer info and equal handles" {
         \\assert(w2 == w and w:buffer() == n)
         \\-- A path with ".." finds the same buffer.
         \\assert(editor.buffer.open(dir .. "/sub/../a.txt") == a)
+        \\-- So does a path through a symbolic link, also for a new file.
+        \\assert(editor.buffer.open(dir .. "/link/a.txt") == a)
+        \\assert(editor.buffer.open(dir .. "/link/new.txt") == n)
         \\-- display does not use a floating window that was selected before.
         \\local f = editor.window.float{{ buffer = n, row = 1, col = 1, width = 10, height = 3 }}
         \\here:focus()

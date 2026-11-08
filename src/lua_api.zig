@@ -529,18 +529,20 @@ fn bufName(state: ?*c.lua_State) callconv(.c) c_int {
 fn bufText(state: ?*c.lua_State) callconv(.c) c_int {
     const L = state.?;
     const e = checkBuffer(L, 1);
-    pushRange(L, &e.buf, 0, e.buf.len());
+    pushRange(L, &e.buf, 0, e.buf.len(), "");
     return 1;
 }
 
-/// Pushes the bytes from `start` to `end` as a Lua string. It copies into
-/// Lua memory directly: a Lua memory error is a longjmp, and it would leak
-/// a Zig allocation.
-fn pushRange(L: *c.lua_State, buf: *const @import("buffer.zig").Buffer, start: usize, end: usize) void {
+/// Pushes the bytes from `start` to `end`, then `suffix`, as one Lua
+/// string. It copies into Lua memory directly: a Lua memory error is a
+/// longjmp, and it would leak a Zig allocation.
+fn pushRange(L: *c.lua_State, buf: *const @import("buffer.zig").Buffer, start: usize, end: usize, suffix: []const u8) void {
+    const n = end - start;
     var b: c.luaL_Buffer = undefined;
-    const out = c.luaL_buffinitsize(L, &b, end - start);
-    buf.copyInto(start, out[0 .. end - start]);
-    c.luaL_pushresultsize(&b, end - start);
+    const out = c.luaL_buffinitsize(L, &b, n + suffix.len);
+    buf.copyInto(start, out[0..n]);
+    @memcpy(out[n..][0..suffix.len], suffix);
+    c.luaL_pushresultsize(&b, n + suffix.len);
 }
 
 fn bufSetText(state: ?*c.lua_State) callconv(.c) c_int {
@@ -679,7 +681,7 @@ fn bufSub(state: ?*c.lua_State) callconv(.c) c_int {
     const len = e.buf.len();
     const start = clampedPos(L, 2, len);
     const end = @max(start, clampedPos(L, 3, len));
-    pushRange(L, &e.buf, start, end);
+    pushRange(L, &e.buf, start, end, "");
     return 1;
 }
 
@@ -751,13 +753,7 @@ fn bufIndentFor(state: ?*c.lua_State) callconv(.c) c_int {
     // The indentation of the anchor line, then one level.
     const ws_end = e.buf.firstNonBlank(line);
     const unit: []const u8 = if (anchor.deeper) options.indentUnit(ctxOf(L).editor.optionsFor(e)) else "";
-    // Copy into Lua memory directly, as `pushRange` does.
-    const ws_len = ws_end - line;
-    var b: c.luaL_Buffer = undefined;
-    const out = c.luaL_buffinitsize(L, &b, ws_len + unit.len);
-    e.buf.copyInto(line, out[0..ws_len]);
-    @memcpy(out[ws_len..][0..unit.len], unit);
-    c.luaL_pushresultsize(&b, ws_len + unit.len);
+    pushRange(L, &e.buf, line, ws_end, unit);
     return 1;
 }
 
