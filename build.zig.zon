@@ -40,6 +40,10 @@
             .url = "https://www.lua.org/ftp/lua-5.5.1.tar.gz",
             .hash = "N-V-__8AAPqeFQDipy0CdI6MKBmwYYarybBTO3IIJPrSzH_w",
         },
+        .rope_zig = .{
+            .url = "git+https://github.com/zachary822/rope-zig#13305ad9b0695a8a37008b81b27af715c880a8e6",
+            .hash = "rope_zig-0.0.0-dueVsjGYAAAjCfxH8bLzxgoc8f4mJ8ojcvjZ7N1k3GwU",
+        },
     },
     .paths = .{
         "build.zig",

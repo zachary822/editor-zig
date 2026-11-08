@@ -47,6 +47,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const rope_dep = b.dependency("rope_zig", .{ .target = target, .optimize = optimize });
+
     const exe = b.addExecutable(.{
         .name = "editor_zig",
         .root_module = b.createModule(.{
@@ -56,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "editor_zig", .module = mod },
                 .{ .name = "c", .module = t.mod },
+                .{ .name = "rope", .module = rope_dep.module("rope_zig") },
             },
         }),
     });

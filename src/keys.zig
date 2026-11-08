@@ -160,6 +160,8 @@ fn parsePlain(bytes: []const u8) Result {
             .key = .{ .codepoint = 'a' + b - 1 },
             .mods = .{ .ctrl = true },
         },
+        // Terminals send 0x1f for both ctrl+/ and ctrl+_. Emacs reads it as C-/.
+        0x1f => .{ .key = .{ .codepoint = '/' }, .mods = .{ .ctrl = true } },
         0x20...0x7e => .{ .key = .{ .codepoint = b } },
         0x80...0xff => {
             const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .invalid = 1 };
@@ -185,6 +187,12 @@ test "Esc" {
 test "Ctrl+C" {
     const r = parse("\x1b[99;5u");
     try testing.expectEqual(@as(u21, 'c'), r.key.event.key.codepoint);
+    try testing.expect(r.key.event.mods.ctrl);
+}
+
+test "legacy Ctrl+/ is 0x1f" {
+    const r = parse("\x1f");
+    try testing.expectEqual(@as(u21, '/'), r.key.event.key.codepoint);
     try testing.expect(r.key.event.mods.ctrl);
 }
 
