@@ -1,17 +1,29 @@
-//! File name completion for the minibuffer.
+//! Completion for the minibuffer.
+//!
+//! A `Source` gives the candidates. `complete` has the logic that is the
+//! same for all sources: the boundary, the prefix filter, the sort and the
+//! longest common prefix.
 
 const std = @import("std");
 const Io = std.Io;
 const testing = std.testing;
 const files = @import("files.zig");
 
+/// Where the completion candidates come from.
+pub const Source = union(enum) {
+    /// File names. Completion works on the part after the last "/".
+    file_names,
+    /// A fixed list, for example { "yes", "no" } or the command names.
+    strings: []const []const u8,
+};
+
 pub const Completion = struct {
     gpa: std.mem.Allocator,
-    /// The completed input: the directory part of the input and the longest
+    /// The completed input: the part before the boundary and the longest
     /// common prefix of the matches. With no matches, it is the input.
     text: []u8,
-    /// The names in the directory that match, sorted. Directory names end
-    /// with "/".
+    /// The candidates that match, sorted. For file names, these are the
+    /// names in the directory, and directory names end with "/".
     matches: [][]u8,
 
     pub fn deinit(self: *Completion) void {
@@ -22,20 +34,70 @@ pub const Completion = struct {
     }
 };
 
+/// Completes `input` from a source. For file names, a relative directory is
+/// relative to `root`, and "~" means `home`.
+pub fn complete(io: Io, root: Io.Dir, gpa: std.mem.Allocator, source: Source, input: []const u8, home: ?[]const u8) !Completion {
+    return switch (source) {
+        .file_names => completeFileName(io, root, gpa, input, home),
+        .strings => |list| completeStrings(gpa, list, input),
+    };
+}
+
+/// True if `text` is a complete candidate, for prompts that accept only
+/// candidates. Any file name is a candidate.
+pub fn isCandidate(source: Source, text: []const u8) bool {
+    return switch (source) {
+        .file_names => true,
+        .strings => |list| for (list) |item| {
+            if (std.mem.eql(u8, item, text)) break true;
+        } else false,
+    };
+}
+
+fn completeStrings(gpa: std.mem.Allocator, list: []const []const u8, input: []const u8) !Completion {
+    var matches: std.ArrayList([]u8) = .empty;
+    errdefer freeList(gpa, &matches);
+    for (list) |item| {
+        if (!std.mem.startsWith(u8, item, input)) continue;
+        const copy = try gpa.dupe(u8, item);
+        errdefer gpa.free(copy);
+        try matches.append(gpa, copy);
+    }
+    return finish(gpa, "", input, &matches);
+}
+
+/// The shared end of each completion: sorts the matches and makes the
+/// completed text from `before` (the part before the boundary) and the
+/// common prefix. It takes ownership of `matches`.
+fn finish(gpa: std.mem.Allocator, before: []const u8, typed: []const u8, matches: *std.ArrayList([]u8)) !Completion {
+    errdefer freeList(gpa, matches);
+    std.mem.sort([]u8, matches.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    const common = if (matches.items.len == 0) typed else commonPrefix(matches.items);
+    const text = try std.mem.concat(gpa, u8, &.{ before, common });
+    errdefer gpa.free(text);
+    return .{ .gpa = gpa, .text = text, .matches = try matches.toOwnedSlice(gpa) };
+}
+
+fn freeList(gpa: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |m| gpa.free(m);
+    list.deinit(gpa);
+}
+
 /// Completes the last part of a file name, as Emacs does for "Find file:".
 /// The directory part (up to the last "/") selects the directory, relative
 /// to `root` if it is not absolute. "~" in it means `home`. Names that start
 /// with "." match only if the typed part also starts with ".".
-pub fn completeFileName(io: Io, root: Io.Dir, gpa: std.mem.Allocator, input: []const u8, home: ?[]const u8) !Completion {
+fn completeFileName(io: Io, root: Io.Dir, gpa: std.mem.Allocator, input: []const u8, home: ?[]const u8) !Completion {
     const slash = std.mem.lastIndexOfScalar(u8, input, '/');
     const dir_part = if (slash) |s| input[0 .. s + 1] else "";
     const prefix = if (slash) |s| input[s + 1 ..] else input;
 
     var matches: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (matches.items) |m| gpa.free(m);
-        matches.deinit(gpa);
-    }
+    errdefer freeList(gpa, &matches);
 
     const open_path = try files.expandPath(gpa, if (dir_part.len == 0) "." else dir_part, home);
     defer gpa.free(open_path);
@@ -58,16 +120,7 @@ pub fn completeFileName(io: Io, root: Io.Dir, gpa: std.mem.Allocator, input: []c
         }
     } else |_| {} // No such directory: no matches.
 
-    std.mem.sort([]u8, matches.items, {}, struct {
-        fn lessThan(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lessThan);
-
-    const common = if (matches.items.len == 0) prefix else commonPrefix(matches.items);
-    const text = try std.mem.concat(gpa, u8, &.{ dir_part, common });
-    errdefer gpa.free(text);
-    return .{ .gpa = gpa, .text = text, .matches = try matches.toOwnedSlice(gpa) };
+    return finish(gpa, dir_part, prefix, &matches);
 }
 
 /// The longest prefix that all names share, cut at a codepoint boundary.
@@ -117,7 +170,7 @@ test "hidden files need a dot, and prefixes keep whole codepoints" {
     try makeTree(tmp.dir);
 
     try expectCompletion(tmp.dir, ".h", ".hidden", &.{".hidden"});
-    var comp = try completeFileName(testing.io, tmp.dir, testing.allocator, "", null);
+    var comp = try complete(testing.io, tmp.dir, testing.allocator, .file_names, "", null);
     defer comp.deinit();
     for (comp.matches) |m| try testing.expect(m[0] != '.');
 
@@ -129,4 +182,22 @@ test "commonPrefix does not cut a codepoint" {
     // "é" is c3 a9 and "è" is c3 a8: they share only the first byte.
     try testing.expectEqualStrings("a", commonPrefix(&.{ "aé", "aè" }));
     try testing.expectEqualStrings("abc", commonPrefix(&.{ "abc", "abcd" }));
+}
+
+test "completion from a list of strings" {
+    const list: []const []const u8 = &.{ "forward_char", "forward_sexp", "find_file", "yank" };
+    var comp = try complete(testing.io, Io.Dir.cwd(), testing.allocator, .{ .strings = list }, "fo", null);
+    defer comp.deinit();
+    try testing.expectEqualStrings("forward_", comp.text);
+    try testing.expectEqual(2, comp.matches.len);
+    try testing.expectEqualStrings("forward_char", comp.matches[0]);
+
+    var none = try complete(testing.io, Io.Dir.cwd(), testing.allocator, .{ .strings = list }, "zz", null);
+    defer none.deinit();
+    try testing.expectEqualStrings("zz", none.text);
+    try testing.expectEqual(0, none.matches.len);
+
+    try testing.expect(isCandidate(.{ .strings = list }, "yank"));
+    try testing.expect(!isCandidate(.{ .strings = list }, "yan"));
+    try testing.expect(isCandidate(.file_names, "anything"));
 }

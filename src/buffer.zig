@@ -53,8 +53,20 @@ pub const Buffer = struct {
     /// Changes on each text change. A syntax tree uses it to know when to
     /// parse again.
     version: u64 = 0,
+    /// A read-only buffer rejects edits from the user. Code can still change
+    /// it with `setText` and `appendText`.
+    read_only: bool = false,
+    /// True while `setText` or `appendText` changes a read-only buffer.
+    force_write: bool = false,
+    /// Ranges with a face, for example from Lua. They move with edits, as
+    /// Emacs overlays do.
+    highlights: std.ArrayList(Highlight) = .empty,
 
     pub const Region = struct { start: usize, end: usize };
+
+    /// A face for the bytes from `start` to `end`. The face is an ID in the
+    /// editor's face list.
+    pub const Highlight = struct { start: usize, end: usize, face: u16 };
 
     pub fn init(gpa: std.mem.Allocator) Buffer {
         return .{ .rope = .init(gpa) };
@@ -74,6 +86,7 @@ pub const Buffer = struct {
         for (self.redo_stack.items) |entry| self.rope.release(entry.snap);
         self.redo_stack.deinit(gpa);
         self.rope.release(self.saved);
+        self.highlights.deinit(gpa);
         if (self.file_path) |p| gpa.free(p);
         self.rope.deinit();
         self.* = undefined;
@@ -163,27 +176,78 @@ pub const Buffer = struct {
     /// Inserts into the rope, moves the mark and makes the region inactive.
     /// All edits go through this function or `editDelete`.
     fn editInsert(self: *Buffer, pos: usize, text: []const u8) !void {
+        if (self.read_only and !self.force_write) return error.ReadOnly;
         try self.rope.insert(pos, text);
         self.version +%= 1;
         // As an Emacs marker, the mark stays before text inserted at its position.
         if (self.mark) |*m| {
             if (m.* > pos) m.* += text.len;
         }
+        // A highlight grows with text inserted inside it, but not with text
+        // inserted at its start or end.
+        for (self.highlights.items) |*h| {
+            if (h.start > pos) h.start += text.len;
+            if (h.end > pos) h.end += text.len;
+        }
         self.mark_active = false;
     }
 
     /// Deletes from the rope, moves the mark and makes the region inactive.
     fn editDelete(self: *Buffer, start: usize, count: usize) !void {
+        if (self.read_only and !self.force_write) return error.ReadOnly;
         try self.rope.delete(start, count);
         self.version +%= 1;
-        if (self.mark) |*m| {
-            if (m.* >= start + count) {
-                m.* -= count;
-            } else if (m.* > start) {
-                m.* = start;
+        if (self.mark) |*m| m.* = afterDelete(m.*, start, count);
+        var i: usize = 0;
+        while (i < self.highlights.items.len) {
+            const h = &self.highlights.items[i];
+            h.start = afterDelete(h.start, start, count);
+            h.end = afterDelete(h.end, start, count);
+            if (h.start >= h.end) {
+                _ = self.highlights.orderedRemove(i); // the deletion removed all of it
+            } else {
+                i += 1;
             }
         }
         self.mark_active = false;
+    }
+
+    /// The new position of `pos` after a deletion of `count` bytes at `start`.
+    fn afterDelete(pos: usize, start: usize, count: usize) usize {
+        if (pos >= start + count) return pos - count;
+        return @min(pos, start);
+    }
+
+    // Program changes and highlights
+
+    /// Replaces all text and puts the cursor at the start. It works in a
+    /// read-only buffer too, and removes all highlights.
+    pub fn setText(self: *Buffer, text: []const u8) !void {
+        self.force_write = true;
+        defer self.force_write = false;
+        try self.replaceRange(0, self.len(), text);
+        self.highlights.clearRetainingCapacity();
+        self.moveTo(0);
+    }
+
+    /// Adds text at the end. It works in a read-only buffer too. The cursor
+    /// stays where it is.
+    pub fn appendText(self: *Buffer, text: []const u8) !void {
+        if (text.len == 0) return;
+        self.force_write = true;
+        defer self.force_write = false;
+        try self.recordUndo(.other);
+        try self.editInsert(self.len(), text);
+    }
+
+    pub fn addHighlight(self: *Buffer, start: usize, end: usize, face: u16) !void {
+        if (start > end or end > self.len()) return error.InvalidRange;
+        if (start == end) return;
+        try self.highlights.append(self.rope.gpa, .{ .start = start, .end = end, .face = face });
+    }
+
+    pub fn clearHighlights(self: *Buffer) void {
+        self.highlights.clearRetainingCapacity();
     }
 
     // Editing
@@ -308,6 +372,7 @@ pub const Buffer = struct {
     /// Puts the text and cursor back to how they were before the last undo
     /// step. Each undo goes one more step back.
     pub fn undo(self: *Buffer) !void {
+        if (self.read_only) return error.ReadOnly;
         if (self.undo_stack.items.len == 0) return error.NothingToUndo;
         try self.pushState(&self.redo_stack);
         self.popState(&self.undo_stack);
@@ -315,6 +380,7 @@ pub const Buffer = struct {
 
     /// Does again the change that the last undo took away.
     pub fn redo(self: *Buffer) !void {
+        if (self.read_only) return error.ReadOnly;
         if (self.redo_stack.items.len == 0) return error.NothingToRedo;
         try self.pushState(&self.undo_stack);
         self.popState(&self.redo_stack);
@@ -344,12 +410,21 @@ pub const Buffer = struct {
         self.last_edit = null;
         // The saved text can be shorter, so keep the mark inside it.
         if (self.mark) |*m| m.* = @min(m.*, self.len());
+        // Keep the highlights inside the text too.
+        var i: usize = 0;
+        while (i < self.highlights.items.len) {
+            const h = &self.highlights.items[i];
+            h.end = @min(h.end, self.len());
+            if (h.start >= h.end) _ = self.highlights.orderedRemove(i) else i += 1;
+        }
         self.mark_active = false;
     }
 
     /// Saves the text before an edit, unless the edit continues a group.
     /// A new edit also clears the redo stack.
     fn recordUndo(self: *Buffer, kind: EditKind) !void {
+        // All edits call this first, so a rejected edit adds no undo step.
+        if (self.read_only and !self.force_write) return error.ReadOnly;
         for (self.redo_stack.items) |entry| self.rope.release(entry.snap);
         self.redo_stack.clearRetainingCapacity();
 
@@ -449,12 +524,17 @@ pub const Buffer = struct {
 
     /// The zero-based line number of the cursor.
     pub fn cursorLine(self: *const Buffer) usize {
+        return self.lineOf(self.cursor);
+    }
+
+    /// The zero-based line number of the byte position `target`.
+    pub fn lineOf(self: *const Buffer, target: usize) usize {
         var line: usize = 0;
         var pos: usize = 0;
         var it = self.rope.chunks();
         while (it.next()) |chunk| {
-            if (pos + chunk.len >= self.cursor) {
-                return line + std.mem.count(u8, chunk[0 .. self.cursor - pos], "\n");
+            if (pos + chunk.len >= target) {
+                return line + std.mem.count(u8, chunk[0 .. target - pos], "\n");
             }
             line += std.mem.count(u8, chunk, "\n");
             pos += chunk.len;
@@ -625,6 +705,47 @@ test "modified state follows edits, saves and undo" {
     try buf.setFilePath("a.txt");
     try buf.setFilePath("b.txt");
     try testing.expectEqualStrings("b.txt", buf.file_path.?);
+}
+
+test "highlights move with edits" {
+    var buf = try Buffer.initText(testing.allocator, "hello big world");
+    defer buf.deinit();
+    try buf.addHighlight(6, 9, 1); // "big"
+    try testing.expectError(error.InvalidRange, buf.addHighlight(5, 99, 1));
+
+    buf.cursor = 0;
+    try buf.insert(">> "); // before: the range moves
+    try testing.expectEqual(Buffer.Highlight{ .start = 9, .end = 12, .face = 1 }, buf.highlights.items[0]);
+    buf.cursor = 10;
+    try buf.insert("i"); // inside: the range grows
+    try testing.expectEqual(@as(usize, 13), buf.highlights.items[0].end);
+    buf.cursor = 13;
+    try buf.insert("!"); // at the end: not included
+    try testing.expectEqual(@as(usize, 13), buf.highlights.items[0].end);
+
+    buf.cursor = 9;
+    freeKill(try buf.killLines(testing.allocator, 1)); // deletes all of it
+    try testing.expectEqual(0, buf.highlights.items.len);
+}
+
+test "a read-only buffer rejects edits, but setText and appendText work" {
+    var buf = try Buffer.initText(testing.allocator, "abc");
+    defer buf.deinit();
+    buf.read_only = true;
+    try testing.expectError(error.ReadOnly, buf.insert("x"));
+    try testing.expectError(error.ReadOnly, buf.deleteForward());
+    try testing.expectError(error.ReadOnly, buf.undo());
+    try testing.expectEqual(0, buf.undo_stack.items.len); // no empty undo step
+
+    try buf.setText("new text");
+    try buf.appendText("!");
+    try buf.addHighlight(0, 3, 2);
+    try testing.expectEqual(0, buf.cursor);
+    const got = try buf.copyRange(testing.allocator, 0, buf.len());
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("new text!", got);
+    try buf.setText("x"); // removes the highlights
+    try testing.expectEqual(0, buf.highlights.items.len);
 }
 
 test "lineOffset and version" {
