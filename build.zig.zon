@@ -44,6 +44,10 @@
             .url = "git+https://github.com/zachary822/rope-zig#13305ad9b0695a8a37008b81b27af715c880a8e6",
             .hash = "rope_zig-0.0.0-dueVsjGYAAAjCfxH8bLzxgoc8f4mJ8ojcvjZ7N1k3GwU",
         },
+        .tree_sitter = .{
+            .url = "https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.27.2.tar.gz",
+            .hash = "tree_sitter-0.27.2-Tw2sR8H1DQA0X6RmzcaABPYo71PUgl1SnGAn9YOYBYyU",
+        },
     },
     .paths = .{
         "build.zig",

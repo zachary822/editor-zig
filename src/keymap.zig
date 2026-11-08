@@ -209,6 +209,10 @@ pub fn Dispatcher(comptime Command: type) type {
         };
 
         root: *const Map,
+        /// A keymap that the dispatcher searches before `root` for the first
+        /// key of a sequence, as an Emacs local map. Keys that it does not
+        /// bind go to `root`.
+        overlay: ?*const Map = null,
         current: ?*const Map = null,
         /// ESC was pressed. The next key gets the alt modifier.
         meta: bool = false,
@@ -240,8 +244,13 @@ pub fn Dispatcher(comptime Command: type) type {
                 return .cancel;
             }
 
-            const map = self.current orelse self.root;
-            if (map.get(chord)) |b| switch (b) {
+            const binding = if (self.current) |map| map.get(chord) else blk: {
+                if (self.overlay) |o| {
+                    if (o.get(chord)) |b| break :blk b;
+                }
+                break :blk self.root.get(chord);
+            };
+            if (binding) |b| switch (b) {
                 .prefix => |next| {
                     self.current = next;
                     return .prefix;
@@ -353,6 +362,27 @@ test "ESC then a key is the same as alt" {
     try testing.expectEqual(TestCmd.other, d.feed(press('x', .{ .alt = true })).run);
     try testing.expectEqual(.prefix, d.feed(press(0x1b, .{})));
     try testing.expectEqual(TestCmd.other, d.feed(press('x', .{})).run);
+}
+
+test "the overlay keymap comes before the root keymap" {
+    const gpa = testing.allocator;
+    var global: Keymap(TestCmd) = .{};
+    defer global.deinit(gpa);
+    try global.bindKeys(gpa, "RET", .other);
+    try global.bindKeys(gpa, "C-x C-s", .save);
+    var local: Keymap(TestCmd) = .{};
+    defer local.deinit(gpa);
+    try local.bindKeys(gpa, "RET", .quit);
+
+    var d: Dispatcher(TestCmd) = .init(&global);
+    d.overlay = &local;
+    try testing.expectEqual(TestCmd.quit, d.feed(press(0x0d, .{})).run);
+    // Keys that the overlay does not bind go to the root keymap.
+    _ = d.feed(press('x', .{ .ctrl = true }));
+    try testing.expectEqual(TestCmd.save, d.feed(press('s', .{ .ctrl = true })).run);
+
+    d.overlay = null;
+    try testing.expectEqual(TestCmd.other, d.feed(press(0x0d, .{})).run);
 }
 
 test "later bindings replace earlier ones" {

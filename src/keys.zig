@@ -35,6 +35,18 @@ pub const KeyEvent = struct {
     kind: Kind = .press,
     shifted: ?u21 = null,
     base: ?u21 = null,
+
+    /// The text that this key types, or null for a key that is not a
+    /// codepoint. With shift, it is the shifted codepoint if the terminal
+    /// reports one.
+    pub fn typedCodepoint(event: KeyEvent) ?u21 {
+        const cp = switch (event.key) {
+            .codepoint => |cp| cp,
+            else => return null,
+        };
+        if (event.mods.shift) return event.shifted orelse cp;
+        return cp;
+    }
 };
 
 pub const Result = union(enum) {

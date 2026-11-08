@@ -42,6 +42,15 @@ pub fn build(b: *std.Build) void {
     t.addIncludePath(lua_dep.path("src")); // translate-c finds lua.h here
     t.linkLibrary(lua); // links liblua.a into users of `c`
 
+    // Tree-sitter core only. Grammars load at runtime from `init.lua`.
+    const ts_dep = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = optimize,
+        .amalgamated = true,
+    });
+    t.addIncludePath(ts_dep.path("lib/include"));
+    t.linkLibrary(ts_dep.artifact("tree-sitter"));
+
     const mod = b.addModule("editor_zig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
