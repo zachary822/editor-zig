@@ -103,16 +103,16 @@ pub fn parseChord(tok: []const u8) ParseError!Chord {
 fn namedKey(name: []const u8) ?keys.Key {
     const Named = struct { []const u8, keys.Key };
     const table = [_]Named{
-        .{ "RET", .{ .codepoint = 0x0d } },    .{ "return", .{ .codepoint = 0x0d } },
-        .{ "TAB", .{ .codepoint = 0x09 } },    .{ "tab", .{ .codepoint = 0x09 } },
-        .{ "ESC", .{ .codepoint = 0x1b } },    .{ "escape", .{ .codepoint = 0x1b } },
-        .{ "DEL", .{ .codepoint = 0x7f } },    .{ "backspace", .{ .codepoint = 0x7f } },
-        .{ "SPC", .{ .codepoint = ' ' } },     .{ "space", .{ .codepoint = ' ' } },
-        .{ "up", .up },                        .{ "down", .down },
-        .{ "left", .left },                    .{ "right", .right },
-        .{ "home", .home },                    .{ "end", .end },
-        .{ "insert", .insert },                .{ "delete", .delete },
-        .{ "prior", .page_up },                .{ "next", .page_down },
+        .{ "RET", .{ .codepoint = 0x0d } }, .{ "return", .{ .codepoint = 0x0d } },
+        .{ "TAB", .{ .codepoint = 0x09 } }, .{ "tab", .{ .codepoint = 0x09 } },
+        .{ "ESC", .{ .codepoint = 0x1b } }, .{ "escape", .{ .codepoint = 0x1b } },
+        .{ "DEL", .{ .codepoint = 0x7f } }, .{ "backspace", .{ .codepoint = 0x7f } },
+        .{ "SPC", .{ .codepoint = ' ' } },  .{ "space", .{ .codepoint = ' ' } },
+        .{ "up", .up },                     .{ "down", .down },
+        .{ "left", .left },                 .{ "right", .right },
+        .{ "home", .home },                 .{ "end", .end },
+        .{ "insert", .insert },             .{ "delete", .delete },
+        .{ "prior", .page_up },             .{ "next", .page_down },
     };
     for (table) |entry| {
         if (std.mem.eql(u8, entry[0], name)) return entry[1];
