@@ -2212,16 +2212,26 @@ fn configPath(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?[
     return try std.fs.path.joinZ(arena, &.{ home, ".config", "editor-zig", "init.lua" });
 }
 
-/// Lets `require` find modules in the directory of the config file:
+/// Returns `<prefix>/share/editor-zig/lua` for an executable in
+/// `<prefix>/bin`: the directory of the plugins that come with the editor.
+/// Returns null if the editor cannot find its own path.
+fn pluginDir(io: Io, arena: std.mem.Allocator) ?[]const u8 {
+    const exe_dir = std.process.executableDirPathAlloc(io, arena) catch return null;
+    const prefix = std.fs.path.dirname(exe_dir) orelse return null;
+    return std.fs.path.join(arena, &.{ prefix, "share", "editor-zig", "lua" }) catch null;
+}
+
+/// Lets `require` find modules in `dir`:
 /// `require("foo")` loads `<dir>/foo.lua` or `<dir>/foo/init.lua`, and
 /// `require("a.b")` loads `<dir>/a/b.lua`. C modules load from `<dir>/?.so`.
-/// The directory comes before the default paths, so its modules win.
+/// The directory comes before the paths that are in `package.path` now, so
+/// its modules win.
 ///
 /// Lua path templates use ";" between templates and "?" for the module
 /// name, and they have no escape. A directory with one of these characters
-/// cannot be in the path, so this returns error.UnusableConfigDir.
-fn addConfigDirToPath(L: *c.lua_State, dir: []const u8) !void {
-    if (std.mem.indexOfAny(u8, dir, ";?") != null) return error.UnusableConfigDir;
+/// cannot be in the path, so this returns error.UnusableDir.
+fn addDirToPath(L: *c.lua_State, dir: []const u8) !void {
+    if (std.mem.indexOfAny(u8, dir, ";?") != null) return error.UnusableDir;
     _ = c.lua_getglobal(L, "package");
     defer c.lua_settop(L, -2); // pop `package`
     prependSearchPath(L, "path", dir, &.{ "?.lua", "?/init.lua" });
@@ -2243,9 +2253,10 @@ fn prependSearchPath(L: *c.lua_State, comptime field: [:0]const u8, dir: []const
 
 /// Loads and runs the config file. If the file is missing or has an error,
 /// the editor starts without it, and an error shows in the echo area.
-/// Modules next to the file load with `require`.
+/// Modules next to the file load with `require`. They come before the
+/// plugins that come with the editor, so a config module can replace one.
 fn loadConfig(editor: *Editor, L: *c.lua_State, path: [:0]const u8) void {
-    if (std.fs.path.dirname(path)) |dir| addConfigDirToPath(L, dir) catch {
+    if (std.fs.path.dirname(path)) |dir| addDirToPath(L, dir) catch {
         editor.setMessage("init.lua: require cannot find modules in {s}: its path has \";\" or \"?\"", .{dir});
     };
     if (c.luaL_loadfilex(L, path.ptr, null) != c.LUA_OK or
@@ -2298,6 +2309,10 @@ pub fn main(init: std.process.Init) !void {
     defer editor.deinit();
     var lua_ctx: lua_api.Context = .{ .gpa = gpa, .keymap = &km, .languages = &languages, .home = home, .editor = &editor };
     lua_api.register(L, &lua_ctx);
+    // Add the plugin directory first, so the config directory comes before it.
+    if (pluginDir(io, init.arena.allocator())) |dir| addDirToPath(L, dir) catch {
+        editor.setMessage("require cannot find the editor plugins in {s}: its path has \";\" or \"?\"", .{dir});
+    };
     if (try configPath(init.arena.allocator(), init.environ_map)) |path| {
         loadConfig(&editor, L, path);
     }
@@ -2663,6 +2678,36 @@ test "init.lua can require modules from its own directory" {
         \\assert(found == "mod pkg a.b", tostring(found))
         \\-- The standard library is already loaded, so require gives it.
         \\assert(require("string") == string)
+    );
+}
+
+test "a config module replaces a plugin with the same name" {
+    const t = try TestEditor.createWithLua();
+    defer t.destroy();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "plugins");
+    try tmp.dir.createDirPath(testing.io, "config");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plugins/both.lua", .data = "return 'plugin'" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plugins/only.lua", .data = "return 'plugin'" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config/both.lua", .data = "return 'config'" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config/init.lua", .data =
+        \\found = require("both") .. " " .. require("only")
+    });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(testing.io, &dir_buf)];
+    const plugins = try std.fs.path.join(testing.allocator, &.{ dir, "plugins" });
+    defer testing.allocator.free(plugins);
+    const path = try std.fs.path.joinZ(testing.allocator, &.{ dir, "config", "init.lua" });
+    defer testing.allocator.free(path);
+    // The same order as main: the plugin directory first, then the config.
+    try addDirToPath(t.L.?, plugins);
+    loadConfig(&t.ed, t.L.?, path);
+
+    try testing.expectEqualStrings("", t.message()); // no error
+    try t.lua(
+        \\assert(found == "config plugin", tostring(found))
     );
 }
 

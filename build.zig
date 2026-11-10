@@ -78,8 +78,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // `zig build run -- <args>`
-    const run_cmd = b.addRunArtifact(exe);
+    // The Lua plugins that come with the editor. The editor finds them at
+    // `<exe dir>/../share/editor-zig/lua`, but it does not load them.
+    // init.lua loads them with `require`.
+    b.installDirectory(.{
+        .source_dir = b.path("lua"),
+        .install_dir = .prefix,
+        .install_subdir = "share/editor-zig/lua",
+    });
+
+    // `zig build run -- <args>`. This runs the installed executable, not the
+    // one in the cache, so that it finds the installed plugins.
+    const run_cmd = std.Build.Step.Run.create(b, "run editor_zig");
+    run_cmd.addFileArg(.{ .relative = .{ .base = .install_bin, .sub_path = exe.out_filename } });
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
 
